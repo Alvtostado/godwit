@@ -9,6 +9,8 @@ import (
 	"io"
 	"mime"
 	"net"
+	"net/netip"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/emersion/go-message/charset"
 	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
+	"github.com/godwit-email/godwit/internal/sysproxy"
 )
 
 // Security selects the transport protection of a connection.
@@ -37,6 +40,10 @@ var ErrAuthFailed = errors.New("authentication failed")
 // ClientVersion is sent in the IMAP ID command; release builds set it.
 var ClientVersion = "dev"
 
+// SystemProxy is the proxy for a request to u, nil for none: the user's;
+// tests stand in for it.
+var SystemProxy = sysproxy.For
+
 // Endpoint describes one server and the credentials to use on it. A non-empty
 // AccessToken selects XOAUTH2 and Password is ignored.
 type Endpoint struct {
@@ -49,12 +56,26 @@ type Endpoint struct {
 
 func (e Endpoint) addr() string { return net.JoinHostPort(e.Host, strconv.Itoa(e.Port)) }
 
+// dial connects to e, through the system proxy when it names one. The proxy
+// gets the host name, not an address, so it resolves it; TLS still checks
+// the certificate against e.Host.
+func (e Endpoint) dial(ctx context.Context) (net.Conn, error) {
+	// a server on this computer (a bridge such as Proton's) never goes through the proxy
+	if ip, err := netip.ParseAddr(e.Host); e.Host != "localhost" && (err != nil || !ip.IsLoopback()) {
+		// https: mail is a tunnel to a non-web port, which is what the https proxy carries
+		if p := SystemProxy(&url.URL{Scheme: "https", Host: e.addr()}); p != nil {
+			return sysproxy.Dial(ctx, p, e.addr())
+		}
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", e.addr())
+}
+
 // open dials e and returns the raw connection plus a bound context. Everything
 // until the returned release func runs (dial, TLS, greeting, auth) is limited to
 // 30 seconds or ctx, whichever ends first; cancellation closes the connection.
 func (e Endpoint) open(ctx context.Context, implicitTLS bool) (net.Conn, context.Context, func(), error) {
 	ctx2, cancel := context.WithTimeout(ctx, timeout)
-	raw, err := (&net.Dialer{}).DialContext(ctx2, "tcp", e.addr())
+	raw, err := e.dial(ctx2)
 	if err != nil {
 		cancel()
 		return nil, nil, nil, err
