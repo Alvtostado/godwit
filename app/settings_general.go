@@ -4,16 +4,20 @@ import (
 	"cmp"
 	"context"
 	"math"
+	"net"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/egoist/mygo/ui"
 	"github.com/godwit-email/godwit/core"
 	"github.com/godwit-email/godwit/internal/i18n"
 	"github.com/godwit-email/godwit/internal/icons"
 	"github.com/godwit-email/godwit/internal/kit"
+	"github.com/godwit-email/godwit/internal/sysproxy"
 	"github.com/godwit-email/godwit/internal/theme"
 )
 
@@ -294,6 +298,122 @@ func (p *settingsPage) generalView(c *ui.Context) {
 				})
 			})
 		})
+	p.proxySection(c)
+}
+
+// proxyDraft is 网络代理 as shown: the custom fields save once they make a
+// usable address, so 自定义 waits for one, and they outlast other modes.
+type proxyDraft struct {
+	mode, scheme, host, port string
+	bypass                   string // 不使用代理的主机, comma-separated
+	hostErr, portErr         string // why the fields don't make an address yet
+	bypassErr                string
+	from                     string // the settings the draft last matched (proxyKey)
+	pass, sent               string // the password typed, never the stored one; and what of it went to the settings
+}
+
+func (p *settingsPage) proxySection(c *ui.Context) {
+	st, d, t := &p.st, &p.proxy, theme.Of(c)
+	if key := proxyKey(st); key != d.from {
+		d.from, d.mode = key, cmp.Or(st.ProxyMode, core.ProxySystem)
+		d.scheme, d.host, d.port = "socks5", "", ""
+		d.bypass = strings.Join(st.ProxyBypass, ", ")
+		if u, err := url.Parse(st.ProxyURL); err == nil && u.Scheme != "" {
+			d.scheme, d.host, d.port = u.Scheme, u.Hostname(), u.Port()
+		}
+	}
+	source := "" // where 跟随系统 finds the proxy
+	if d.mode == core.ProxySystem {
+		source = i18n.T("settings.proxy.system.settings")
+		if sysproxy.FromEnvironment() {
+			source = i18n.T("settings.proxy.system.env")
+		}
+	}
+	input := func(label, msg string, v *string, w float32) func() {
+		return func() {
+			settingRow(c, label, msg, func() {
+				kit.Input(c, v, kit.InputOpts{Invalid: msg != ""}).Width(w).Radius(t.Radius.Lg).Label(label)
+			})
+		}
+	}
+	rows := []func(){func() {
+		settingRow(c, i18n.T("settings.proxy.mode"), source, func() {
+			settingSelect(c, i18n.T("settings.proxy.mode"), &d.mode, []kit.Option[string]{
+				{Value: core.ProxySystem, Label: i18n.T("settings.proxy.system")},
+				{Value: core.ProxyCustom, Label: i18n.T("settings.proxy.custom")},
+				{Value: core.ProxyOff, Label: i18n.T("settings.proxy.off")},
+			})
+		})
+	}}
+	if d.mode == core.ProxyCustom {
+		rows = append(rows, func() {
+			settingRow(c, i18n.T("settings.proxy.type"), i18n.T("settings.proxy.type.help"), func() {
+				settingSelect(c, i18n.T("settings.proxy.type"), &d.scheme, []kit.Option[string]{
+					{Value: "socks5", Label: "SOCKS5"}, {Value: "http", Label: "HTTP"},
+				})
+			})
+		},
+			input(i18n.T("settings.proxy.host"), d.hostErr, &d.host, theme.SettingsInputWidth),
+			input(i18n.T("settings.proxy.port"), d.portErr, &d.port, theme.PortWidth),
+			func() {
+				settingRow(c, i18n.T("settings.proxy.bypass"), cmp.Or(d.bypassErr, i18n.T("settings.proxy.bypass.help")), func() {
+					kit.Input(c, &d.bypass, kit.InputOpts{Invalid: d.bypassErr != ""}).Width(theme.SettingsInputWidth).Radius(t.Radius.Lg).Label(i18n.T("settings.proxy.bypass"))
+				})
+			},
+			input(i18n.T("settings.proxy.user"), "", &st.ProxyUser, theme.SettingsInputWidth),
+			func() {
+				ph := ""
+				if st.ProxyPasswordSet {
+					ph = i18n.T("settings.proxy.password.kept")
+				}
+				settingRow(c, i18n.T("settings.proxy.password"), "", func() {
+					ui.Row(c).Gap(c.Theme().Space(3)).AlignItems(ui.Center).Children(func() {
+						kit.Input(c, &d.pass, kit.InputOpts{Password: true, Placeholder: ph}).Width(theme.SettingsInputWidth).Radius(t.Radius.Lg).Label(i18n.T("settings.proxy.password"))
+						if st.ProxyPasswordSet && d.pass == "" { // a saved one shows only as the placeholder, so erasing can't reach it
+							settingButton(c, i18n.T("settings.proxy.password.clear"), kit.Outline, false).OnClick(func() { st.ProxyPasswordSet = false })
+						}
+					})
+				})
+			})
+	}
+	// a typed password saves; erasing it removes the stored one
+	if d.pass != d.sent {
+		st.ProxyPassword, st.ProxyPasswordSet, d.sent = d.pass, d.pass != "", d.pass
+	}
+	settingsSection(c, i18n.T("settings.proxy"), i18n.T("settings.proxy.foot"), rows...)
+
+	// what the controls changed goes to the settings once it can be saved
+	d.hostErr, d.portErr, d.bypassErr = "", "", ""
+	host := strings.TrimSpace(d.host)
+	bypass := strings.FieldsFunc(d.bypass, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
+	if len(bypass) == 0 {
+		bypass = nil // as an empty list loads
+	}
+	switch port, err := strconv.Atoi(strings.TrimSpace(d.port)); {
+	case d.mode != core.ProxyCustom:
+		if d.mode != cmp.Or(st.ProxyMode, core.ProxySystem) {
+			st.ProxyMode = d.mode
+		}
+	case host == "":
+		d.hostErr = i18n.T("settings.proxy.host.empty")
+	case err != nil || port < 1 || port > 65535:
+		d.portErr = i18n.T("settings.proxy.port.invalid")
+	case len(bypass) > core.MaxProxyBypass:
+		d.bypassErr = i18n.Tf("settings.proxy.bypass.too_many", core.MaxProxyBypass)
+	default:
+		u, err := core.ParseProxyURL(d.scheme + "://" + net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			d.hostErr = i18n.T("settings.proxy.host.invalid")
+			break
+		}
+		st.ProxyMode, st.ProxyURL, st.ProxyBypass = core.ProxyCustom, u.String(), bypass
+	}
+	d.from = proxyKey(st)
+}
+
+// proxyKey is what of st proxyDraft follows (proxyDraft.from).
+func proxyKey(st *core.Settings) string {
+	return st.ProxyMode + " " + st.ProxyURL + " " + strings.Join(st.ProxyBypass, ",")
 }
 
 // aiFeaturesView is the Intelligence page's 功能 tab: the reader's AI features, and

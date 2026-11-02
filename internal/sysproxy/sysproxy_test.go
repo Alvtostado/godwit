@@ -26,8 +26,31 @@ func TestBypassed(t *testing.T) {
 		"CORP.EXAMPLE.":         true,
 		"169.254.10.1.nip.io.x": false,
 	} {
-		if got := bypassed(host, list); got != want {
-			t.Errorf("bypassed(%q) = %v", host, got)
+		if got := Bypassed(host, list); got != want {
+			t.Errorf("Bypassed(%q) = %v", host, got)
+		}
+	}
+}
+
+func TestOnThisComputer(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost":         true,
+		"localhost.":        true,
+		"LOCALHOST.":        true,
+		"foo.localhost":     true,
+		"bridge.LocalHost.": true,
+		"127.0.0.1":         true,
+		"127.8.9.10":        true,
+		"::1":               true,
+		"::ffff:127.0.0.1":  true,
+		"example.com":       false,
+		"localhost.example": false,
+		"notlocalhost":      false,
+		"10.0.0.1":          false,
+		"":                  false,
+	} {
+		if got := OnThisComputer(host); got != want {
+			t.Errorf("OnThisComputer(%q) = %v", host, got)
 		}
 	}
 }

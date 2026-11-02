@@ -4,12 +4,12 @@ package conn
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net"
-	"net/netip"
 	"net/url"
 	"strconv"
 	"time"
@@ -44,6 +44,10 @@ var ClientVersion = "dev"
 // tests stand in for it.
 var SystemProxy = sysproxy.For
 
+// TLSRoots verifies servers' certificates, nil for the system's; tests
+// stand in for it.
+var TLSRoots *x509.CertPool
+
 // Endpoint describes one server and the credentials to use on it. A non-empty
 // AccessToken selects XOAUTH2 and Password is ignored.
 type Endpoint struct {
@@ -61,7 +65,7 @@ func (e Endpoint) addr() string { return net.JoinHostPort(e.Host, strconv.Itoa(e
 // the certificate against e.Host.
 func (e Endpoint) dial(ctx context.Context) (net.Conn, error) {
 	// a server on this computer (a bridge such as Proton's) never goes through the proxy
-	if ip, err := netip.ParseAddr(e.Host); e.Host != "localhost" && (err != nil || !ip.IsLoopback()) {
+	if !sysproxy.OnThisComputer(e.Host) {
 		// https: mail is a tunnel to a non-web port, which is what the https proxy carries
 		if p := SystemProxy(&url.URL{Scheme: "https", Host: e.addr()}); p != nil {
 			return sysproxy.Dial(ctx, p, e.addr())
@@ -87,7 +91,7 @@ func (e Endpoint) open(ctx context.Context, implicitTLS bool) (net.Conn, context
 	stop := context.AfterFunc(ctx2, func() { raw.Close() })
 	var nc net.Conn = raw
 	if implicitTLS {
-		tc := tls.Client(raw, &tls.Config{ServerName: e.Host})
+		tc := tls.Client(raw, &tls.Config{ServerName: e.Host, RootCAs: TLSRoots})
 		if err := tc.HandshakeContext(ctx2); err != nil {
 			err = ctxErr(ctx2, err) // before cancel(), which would make every failure look cancelled
 			stop()
@@ -171,7 +175,7 @@ func dialIMAP(ctx context.Context, e Endpoint, h *imapclient.UnilateralDataHandl
 		return nil, nil, fmt.Errorf("imap connect %s: %w", e.addr(), err)
 	}
 	opts := &imapclient.Options{
-		TLSConfig:   &tls.Config{ServerName: e.Host},
+		TLSConfig:   &tls.Config{ServerName: e.Host, RootCAs: TLSRoots},
 		WordDecoder: &mime.WordDecoder{CharsetReader: charset.Reader}, // GBK/Big5 words in BODYSTRUCTURE
 
 		UnilateralDataHandler: h,
@@ -261,7 +265,7 @@ func dialSMTP(ctx context.Context, e Endpoint) (*smtp.Client, error) {
 	case TLS, None:
 		c = smtp.NewClient(nc)
 	case StartTLS:
-		c, err = smtp.NewClientStartTLS(nc, &tls.Config{ServerName: e.Host})
+		c, err = smtp.NewClientStartTLS(nc, &tls.Config{ServerName: e.Host, RootCAs: TLSRoots})
 	default:
 		err = fmt.Errorf("conn: unknown security %q", e.Security)
 	}

@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,6 +32,7 @@ import (
 	"github.com/godwit-email/godwit/internal/avatar"
 	"github.com/godwit-email/godwit/internal/imagecache"
 	"github.com/godwit-email/godwit/internal/imagefetch"
+	"github.com/godwit-email/godwit/internal/sysproxy"
 )
 
 // ErrClosed is returned by calls made after Close.
@@ -58,6 +60,9 @@ type Options struct {
 	// ImageClient's default does (public hosts only). Core never lets it
 	// follow a redirect or keep cookies. Tests give one that reaches loopback.
 	UnsubscribeClient *http.Client
+	// SystemProxy is the proxy the computer's settings give for a request to
+	// u, nil for none; nil is sysproxy.For. Tests stand in for it.
+	SystemProxy func(u *url.URL) *url.URL
 	// Registry is where reviewed plugins are listed; nil turns the plugin
 	// directory off (DefaultRegistry is Godwit's own). The apps set it.
 	Registry *RegistrySource
@@ -109,8 +114,9 @@ type Service struct {
 	locksMu sync.Mutex
 	locks   map[int64]chan struct{} // per-account 1-slot semaphore: sync and op pushing never overlap
 
-	settingsMu sync.Mutex // settings read then written (SetSettings, the trusted senders)
-	editMu     sync.Mutex // local changes (SetFlags, Move, Delete, drafts, Send) read then write
+	settingsMu sync.Mutex                  // settings read then written (SetSettings, the trusted senders)
+	proxy      atomic.Pointer[proxyConfig] // the saved proxy (loadProxy, SetSettings), read by Proxy
+	editMu     sync.Mutex                  // local changes (SetFlags, Move, Delete, drafts, Send) read then write
 
 	workersMu sync.Mutex
 	workers   map[int64]*worker
@@ -258,6 +264,16 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 			s.nativeEnv = append(s.nativeEnv, kv)
 		}
 	}
+	if opts.SystemProxy == nil {
+		s.opts.SystemProxy = sysproxy.For
+	}
+	if err := s.loadProxy(ctx); err != nil {
+		// an unreadable settings row must not keep mail from starting; the default, 跟随系统, stands until a save
+		slog.Warn("proxy settings unreadable, following the system proxy", "err", err)
+		s.setProxy(defaultSettings(), "")
+	}
+	// the hooks are package-wide: the last Service started owns them
+	conn.SystemProxy, imagefetch.SystemProxy = s.Proxy, s.Proxy
 	if opts.ImageClient == nil {
 		s.opts.ImageClient = imagefetch.NewClient(false)
 		if opts.LookupTXT == nil {
