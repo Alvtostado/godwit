@@ -547,6 +547,33 @@ func flagSet(fl []string) []string {
 	return out
 }
 
+// SetMessageSecurity sets the user's classification of the messages: reason is
+// manual_safe, manual_suspicious or manual_warning, stored under the status
+// gomail.ManualSecurityStatus maps it to and kept from later scans; "" drops it
+// and queues the messages for a fresh scan.
+func (s *Service) SetMessageSecurity(ctx context.Context, messageIDs []int64, reason string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	status, ok := gomail.ManualSecurityStatus(reason)
+	if !ok && reason != "" {
+		return fmt.Errorf("set message security: unknown classification %q", reason)
+	}
+	for _, id := range messageIDs {
+		var err error
+		if reason == "" {
+			_, err = s.db.Execute(ctx, "UPDATE messages SET security_status = NULL, security_reason = NULL, security_scanned_at = 0 WHERE id = ?", id)
+		} else {
+			_, err = s.db.Execute(ctx, "UPDATE messages SET security_status = ?, security_reason = ?, security_scanned_at = ? WHERE id = ?", status, reason, time.Now().Unix(), id)
+		}
+		if err != nil {
+			return fmt.Errorf("set message security %d: %w", id, err)
+		}
+	}
+	s.bus.Publish(events.Event{Type: events.MessagesChanged})
+	return nil
+}
+
 // SetFlags adds then removes flags on the messages locally and queues the change
 // for the server.
 func (s *Service) SetFlags(ctx context.Context, ids []int64, add, remove []string) error {
