@@ -154,6 +154,9 @@ func gui(ctx context.Context, dataDir string) int {
 		ConversationCreated: func(id, v int64) { onApp(func(a *app.App) { a.ConversationCreated(id, v) }) },
 		OnLink:              func(u string) { onApp(func(a *app.App) { a.OpenLink(u) }) },
 		OpenCompose:         func(id int64) { onApp(func(a *app.App) { a.OpenDraft(id) }) }, // a draft Wit made may be in the outbox
+		EditRule: func(r core.Rule, conv, approval int64, ask string) {
+			onApp(func(a *app.App) { a.EditRule(r, conv, approval, ask) })
+		},
 	})
 	mygo.Bind(webui.NewWitPage(wit))
 	// The reader pages, one per expanded message in the main window, each
@@ -236,7 +239,7 @@ func gui(ctx context.Context, dataDir string) int {
 		if err == nil {
 			svc, err = core.New(ctx, core.Options{DataDir: dataDir, AutoSync: true, LabelMail: true, SecurityMail: true, SystemLanguage: lang,
 				Registry: reg, ModelsDev: ai.ModelsDevURL, AppVersion: app.Version, SystemTranslator: systemTranslator(), AppleIntelligence: appleIntelligence(),
-				ConfirmWindow: true, ComposeOpen: windows.IsOpen, OpenURL: mygo.Shell.OpenExternal, GuardCoreML: guardCoreML()})
+				ConfirmWindow: true, ComposeOpen: windows.IsOpen, OpenURL: mygo.Shell.OpenExternal, GuardCoreML: guardCoreML(), PrintPDF: printPDF})
 		}
 		if err != nil {
 			i18n.SetLanguage(lang)

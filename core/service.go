@@ -99,6 +99,9 @@ type Options struct {
 	// (imagefetch.SystemProxy), to public hosts only. Tests give one that
 	// reaches loopback.
 	RecognitionModelClient *http.Client
+	// PrintPDF lays out an HTML document as a PDF, for rules that export
+	// one; the GUI sets it. nil fails those actions (RuleFailNoPDF).
+	PrintPDF func(ctx context.Context, html string) ([]byte, error)
 }
 
 // Service owns the database and event bus of one Godwit data directory.
@@ -117,6 +120,7 @@ type Service struct {
 	settingsMu sync.Mutex                  // settings read then written (SetSettings, the trusted senders)
 	proxy      atomic.Pointer[proxyConfig] // the saved proxy (loadProxy, SetSettings), read by Proxy
 	editMu     sync.Mutex                  // local changes (SetFlags, Move, Delete, drafts, Send) read then write
+	ruleRunMu  sync.Mutex                  // one rule run at a time (runRule): the consumer, a retry, a run over existing mail
 
 	workersMu sync.Mutex
 	workers   map[int64]*worker
@@ -183,7 +187,7 @@ type Service struct {
 	running           map[string]*runningPlugin  // started plugins by name
 	assets            modelAssets                // plugin models' files (assets.go); nil is noModelAssets
 	pluginGen         uint64                     // last runningPlugin.gen handed out
-	hooksMu           sync.Mutex                 // plugin_cursors writes, events_log cleanup, hookWakes
+	hooksMu           sync.Mutex                 // cursor writes, events_log cleanup, hookWakes
 	hookWakes         map[chan struct{}]struct{} // each running dispatcher's wake-up
 	labelsMu          sync.Mutex                 // label writes: a name is checked and saved under it
 	sigMu             sync.Mutex                 // signature writes (read, images stored, HTML saved, unused images cleaned), and a draft taking a signature; before editMu
@@ -347,6 +351,10 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	}
 	s.startJanitor()
 	s.startReclaim()
+	if err := s.startRules(ctx); err != nil {
+		s.Close()
+		return nil, err
+	}
 	if opts.LabelMail {
 		s.startLabeler()
 	}
@@ -671,6 +679,9 @@ func (s *Service) syncAccount(ctx context.Context, accountID int64, explicit boo
 		return err
 	}
 	more, err := mailsync.Fetch(ctx, s.db, c, accountID, s.bus)
+	if err == nil {
+		err = s.logDaily(ctx) // daily rules run after the day's first complete sync
+	}
 	s.notifyHooks() // rows committed before an error count too
 	s.wakeLabeler()
 	if more {

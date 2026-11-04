@@ -9,6 +9,7 @@ import "embed"
 var RemixIcons = map[string]string{
 	"archive":                        "node_modules/remixicon/icons/Business/archive-line.svg",
 	"archive-fill":                   "node_modules/remixicon/icons/Business/archive-fill.svg",
+	"arrow-down":                     "node_modules/remixicon/icons/Arrows/arrow-down-line.svg",
 	"arrow-left":                     "node_modules/remixicon/icons/Arrows/arrow-left-line.svg",
 	"arrow-right":                    "node_modules/remixicon/icons/Arrows/arrow-right-line.svg",
 	"arrow-up":                       "node_modules/remixicon/icons/Arrows/arrow-up-line.svg",
@@ -40,6 +41,8 @@ var RemixIcons = map[string]string{
 	"file-pen":                       "node_modules/remixicon/icons/Document/draft-line.svg",
 	"file-pen-fill":                  "node_modules/remixicon/icons/Document/draft-fill.svg",
 	"file-text":                      "node_modules/remixicon/icons/Document/file-text-line.svg",
+	"filter":                         "node_modules/remixicon/icons/System/filter-3-line.svg",
+	"filter-fill":                    "node_modules/remixicon/icons/System/filter-3-fill.svg",
 	"folder":                         "node_modules/remixicon/icons/Document/folder-3-line.svg",
 	"folder-fill":                    "node_modules/remixicon/icons/Document/folder-open-fill.svg",
 	"forward":                        "node_modules/remixicon/icons/System/share-forward-line.svg",
@@ -148,6 +151,7 @@ var RemixIcons = map[string]string{
 	"outbox-fill":                    "node_modules/remixicon/icons/Business/inbox-unarchive-fill.svg",
 	"panel-left":                     "node_modules/remixicon/icons/Design/layout-left-line.svg",
 	"paperclip":                      "node_modules/remixicon/icons/Editor/attachment-2.svg",
+	"pen-line":                       "node_modules/remixicon/icons/Design/edit-line.svg",
 	"plus":                           "node_modules/remixicon/icons/System/add-line.svg",
 	"printer":                        "node_modules/remixicon/icons/Business/printer-line.svg",
 	"puzzle":                         "node_modules/remixicon/icons/Development/puzzle-line.svg",
@@ -233,6 +237,7 @@ var BrandIcons = map[string]string{
 //go:embed "node_modules/remixicon/icons/Health & Medical/brain-4-line.svg"
 //go:embed "node_modules/remixicon/icons/Health & Medical/brain-4-fill.svg"
 //go:embed node_modules/remixicon/icons/Arrows/arrow-go-back-line.svg
+//go:embed node_modules/remixicon/icons/Arrows/arrow-down-line.svg
 //go:embed node_modules/remixicon/icons/Arrows/arrow-left-line.svg
 //go:embed node_modules/remixicon/icons/Arrows/arrow-right-line.svg
 //go:embed node_modules/remixicon/icons/Arrows/arrow-up-line.svg
@@ -260,6 +265,7 @@ var BrandIcons = map[string]string{
 //go:embed node_modules/remixicon/icons/Business/send-plane-line.svg
 //go:embed node_modules/remixicon/icons/Communication/chat-3-line.svg
 //go:embed node_modules/remixicon/icons/Design/edit-box-line.svg
+//go:embed node_modules/remixicon/icons/Design/edit-line.svg
 //go:embed node_modules/remixicon/icons/Design/hammer-line.svg
 //go:embed node_modules/remixicon/icons/Design/layout-left-line.svg
 //go:embed node_modules/remixicon/icons/Design/magic-line.svg
@@ -282,6 +288,8 @@ var BrandIcons = map[string]string{
 //go:embed node_modules/remixicon/icons/Document/draft-line.svg
 //go:embed node_modules/remixicon/icons/Document/file-copy-line.svg
 //go:embed node_modules/remixicon/icons/Document/file-text-line.svg
+//go:embed node_modules/remixicon/icons/System/filter-3-line.svg
+//go:embed node_modules/remixicon/icons/System/filter-3-fill.svg
 //go:embed node_modules/remixicon/icons/Document/folder-3-line.svg
 //go:embed node_modules/remixicon/icons/Document/folder-open-fill.svg
 //go:embed node_modules/remixicon/icons/Document/newspaper-line.svg

@@ -109,6 +109,7 @@ type settingsPage struct {
 	models *modelsView
 	ext    *extView
 	labels *labelsView
+	rules  *rulesView
 
 	// security rescan
 	secDays     int
@@ -128,7 +129,7 @@ type settingsPage struct {
 func newSettingsPage(a *App) *settingsPage {
 	return &settingsPage{a: a, forms: map[int64]*accountForm{}, usage: map[int64]int64{}, imgSize: -1, boxes: map[int64]*mailbox{}, reauth: map[int64]bool{}, sigDocs: map[int64]sigDoc{},
 		secDays: 30,
-		update:  a.svc.UpdateAccount, models: &modelsView{a: a, checkService: a.svc.CheckModelService, testService: a.svc.TestCapability, testPlugin: a.svc.TestPluginModel, serviceAvatar: a.svc.ModelServiceAvatar}, ext: &extView{a: a, tab: 1}, labels: newLabelsView(a)}
+		update:  a.svc.UpdateAccount, models: &modelsView{a: a, checkService: a.svc.CheckModelService, testService: a.svc.TestCapability, testPlugin: a.svc.TestPluginModel, serviceAvatar: a.svc.ModelServiceAvatar}, ext: &extView{a: a, tab: 1}, labels: newLabelsView(a), rules: &rulesView{a: a}}
 }
 
 // section is the page shown: an unknown or missing account falls back to
@@ -214,6 +215,19 @@ func (p *settingsPage) refresh(hints []events.Event) {
 		}
 	case sec == "masklog" && hints == nil:
 		p.readMaskLog()
+	case sec == "rules" && hints == nil:
+		p.rules.closeEditor()
+		p.rules.load()
+		if m := p.rules.pending; m != nil { // 为类似邮件创建规则
+			p.rules.pending = nil
+			p.rules.fromMail(*m)
+		}
+		if w := p.rules.witRule; w != nil { // Wit's 在编辑器里修改
+			p.rules.witRule = nil
+			p.rules.fromWit(*w)
+		}
+	case sec == "rules" && slices.ContainsFunc(hints, func(ev events.Event) bool { return ev.Type == events.LabelsChanged }):
+		p.rules.load() // a run publishes it: the hit counts
 	}
 }
 
@@ -234,10 +248,10 @@ func (p *settingsPage) Title() (string, string) {
 	return i18n.T("settings.heading"), i18n.T("settings." + sec)
 }
 
-var appSections = []string{"general", "signatures", "models", "labels", "extensions", "privacy", "about"}
+var appSections = []string{"general", "signatures", "models", "labels", "rules", "extensions", "privacy", "about"}
 
 // sectionIcons are the app sections' sidebar icons.
-var sectionIcons = map[string]string{"general": "settings", "signatures": "quill-pen", "models": "brain-4", "labels": "tag", "extensions": "puzzle", "privacy": "shield", "about": "info"}
+var sectionIcons = map[string]string{"general": "settings", "signatures": "quill-pen", "models": "brain-4", "labels": "tag", "rules": "filter", "extensions": "puzzle", "privacy": "shield", "about": "info"}
 
 // Sidebar: the accounts, each with its provider's mark and a status dot,
 // then Add account; then the app's pages.
@@ -316,9 +330,15 @@ func (p *settingsPage) Content(c *ui.Context) {
 	th := c.Theme()
 	sec, acc := p.section()
 	kit.Panel(c, panelRadius(c)).Grow(1).Children(func() {
-		ui.Scroll(c).Grow(1).Children(func() {
+		scroll := ui.Scroll(c).Grow(1)
+		p.rules.viewTop = scroll.LayoutBounds().Y
+		scroll.Children(func() {
 			ui.Column(c).FillWidth().Padding(th.Space(8)).Children(func() {
-				ui.Column(c).FillWidth().MaxWidth(theme.SettingsMaxWidth).AlignSelf(ui.Center).Gap(th.Space(8)).Children(func() {
+				width := float32(theme.SettingsMaxWidth)
+				if sec == "rules" && p.rules.editing { // the rule editor's two columns
+					width = theme.ContentMaxWidth
+				}
+				ui.Column(c).FillWidth().MaxWidth(width).AlignSelf(ui.Center).Gap(th.Space(8)).Children(func() {
 					switch {
 					case acc != nil:
 						p.accountView(c, *acc)
@@ -338,6 +358,8 @@ func (p *settingsPage) Content(c *ui.Context) {
 						p.aiView(c)
 					case sec == "labels":
 						p.labels.view(c, p)
+					case sec == "rules":
+						p.rules.view(c)
 					case sec == "extensions":
 						p.ext.view(c)
 					case sec == "about":
@@ -399,6 +421,26 @@ func settingsCard(c *ui.Context, rows ...func()) {
 			}
 			row()
 		}
+	})
+}
+
+// cardListRow is row i of a settings card's List of n: the card's fill,
+// frosted as a drag lifts the row over the others. That material is not
+// clipped to the card's corners, so the first and last rows round their own.
+func cardListRow(c *ui.Context, i, n int, row func()) ui.Element {
+	t := theme.Of(c)
+	var top, bottom float32
+	if i == 0 {
+		top = t.Radius.Xl - theme.Hairline
+	}
+	if i == n-1 {
+		bottom = t.Radius.Xl - theme.Hairline
+	}
+	return ui.Column(c).FillWidth().Radius(top, top, bottom, bottom).Material(kit.Frost(t.Card)).Children(func() {
+		if i > 0 {
+			hairline(c)
+		}
+		row()
 	})
 }
 
