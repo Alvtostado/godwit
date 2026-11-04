@@ -662,6 +662,8 @@ func (s *Service) syncAccount(ctx context.Context, accountID int64, explicit boo
 	}
 	defer release()
 	defer func() { conn.LogTrace(c, err) }() // a response go-imap could not parse goes in the error report
+	// Purges due after this round starts wake the worker again.
+	defer s.wakeForPurge(ctx, accountID, s.clk().Now())
 	// Queued first, so this round's push expunges and its fetch drops the rows.
 	if err := mailsync.QueuePurge(ctx, s.db, c, accountID); err != nil {
 		return err
@@ -732,8 +734,8 @@ func (s *Service) checkSMTP(ctx context.Context, accountID int64, explicit bool)
 // pushOps pushes queued local changes. Ops that became conflict or failed are
 // announced with SyncFailed and the sync goes on.
 func (s *Service) pushOps(ctx context.Context, c *imapclient.Client, accountID int64,
-	push func(context.Context, *store.DB, *imapclient.Client, int64) error) error {
-	err := push(ctx, s.db, c, accountID)
+	push func(context.Context, *store.DB, *imapclient.Client, int64, time.Time) error) error {
+	err := push(ctx, s.db, c, accountID, s.clk().Now())
 	var problems *mailsync.OpsError
 	if errors.As(err, &problems) {
 		if len(problems.Changed) > 0 {
@@ -772,8 +774,8 @@ func (s *Service) setStatus(ctx context.Context, accountID int64, status, detail
 // Gmail's Starred (flagged) are detected only.
 func (s *Service) ListFolders(ctx context.Context, accountID int64) ([]Folder, error) {
 	rows, err := s.db.Query(ctx, `SELECT f.id, f.account_id, f.name, CASE WHEN f.role IN ('inbox', 'flagged') THEN f.role ELSE '' END,
-		(SELECT count(*) FROM messages m WHERE m.folder_id = f.id AND instr(m.flags, '\Seen') = 0), f.delim,
-		(SELECT count(*) FROM messages m WHERE m.folder_id = f.id)
+		(SELECT count(*) FROM messages m WHERE m.folder_id = f.id AND instr(m.flags, '\Seen') = 0 AND `+notPurgedCond+`), f.delim,
+		(SELECT count(*) FROM messages m WHERE m.folder_id = f.id AND `+notPurgedCond+`)
 		FROM folders f WHERE f.account_id = ? ORDER BY f.id`, accountID)
 	if err != nil {
 		return nil, err
@@ -799,8 +801,8 @@ func (s *Service) ListFolders(ctx context.Context, accountID int64) ([]Folder, e
 
 // StarredCounts returns the unread count of starred messages by account ID, and total unread across all accounts.
 func (s *Service) StarredCounts(ctx context.Context) (map[int64]int, int, error) {
-	rows, err := s.db.Query(ctx, `SELECT account_id, count(*) FROM messages
-		WHERE instr(flags, '\Flagged') > 0 AND instr(flags, '\Seen') = 0 GROUP BY account_id`)
+	rows, err := s.db.Query(ctx, `SELECT account_id, count(*) FROM messages m
+		WHERE instr(flags, '\Flagged') > 0 AND instr(flags, '\Seen') = 0 AND `+notPurgedCond+` GROUP BY account_id`)
 	if err != nil {
 		return nil, 0, err
 	}
