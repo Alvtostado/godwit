@@ -262,3 +262,23 @@ func TestCutUTF8(t *testing.T) {
 		assert.Equal(t, tt.cut, cut, "%q %d", tt.s, tt.n)
 	}
 }
+
+// A quoted-printable part may carry a raw NUL (some servers append one after the
+// final CRLF) or an "=00" escape. Both are dropped and the rest decodes.
+func TestDecodePartQuotedPrintableDropsNUL(t *testing.T) {
+	got, err := mail.DecodePart([]byte("=E9=AA=8C=E8=AF=81=E7=A0=81=0A\r\n\x00"), "quoted-printable", "UTF-8")
+	require.NoError(t, err)
+	assert.Equal(t, "验证码\n\r\n", string(got))
+
+	// Written as the escape it decodes to the same byte, which must not reach the
+	// text either: SQLite ends a TEXT value at its first NUL.
+	got, err = mail.DecodePart([]byte("=E9=AA=8C=E8=AF=81=E7=A0=81=00"), "quoted-printable", "UTF-8")
+	require.NoError(t, err)
+	assert.Equal(t, "验证码", string(got))
+
+	// In UTF-16 the zero bytes are half of each character and must survive
+	// until the charset step.
+	got, err = mail.DecodePart([]byte("h=00i=00"), "quoted-printable", "UTF-16LE")
+	require.NoError(t, err)
+	assert.Equal(t, "hi", string(got))
+}

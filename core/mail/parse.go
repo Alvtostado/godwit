@@ -255,8 +255,6 @@ func (p *Parsed) addBody(isHTML bool, r io.Reader, path string) {
 	*dst += string(b)
 }
 
-// DecodePart decodes a separately fetched MIME part body using its recorded
-// transfer encoding and (for text) charset.
 // CutUTF8 keeps at most n bytes of s, at a rune boundary, and reports whether it cut.
 func CutUTF8(s string, n int) (string, bool) {
 	if len(s) <= n {
@@ -269,7 +267,10 @@ func CutUTF8(s string, n int) (string, bool) {
 	return s[:n], true
 }
 
+// DecodePart decodes a separately fetched MIME part body using its recorded
+// transfer encoding and (for text) charset.
 func DecodePart(data []byte, encoding, cs string) ([]byte, error) {
+	qp := false
 	switch strings.ToLower(strings.TrimSpace(encoding)) {
 	case "base64":
 		clean := bytes.Map(func(r rune) rune {
@@ -283,19 +284,29 @@ func DecodePart(data []byte, encoding, cs string) ([]byte, error) {
 			return nil, err
 		}
 	case "quoted-printable":
+		// A raw NUL is not legal quoted-printable, but some servers append one
+		// after the final CRLF; Go's reader fails the whole part on it.
+		qp = true
 		var err error
-		if data, err = io.ReadAll(quotedprintable.NewReader(bytes.NewReader(data))); err != nil {
+		if data, err = io.ReadAll(quotedprintable.NewReader(bytes.NewReader(bytes.ReplaceAll(data, []byte{0}, nil)))); err != nil {
 			return nil, err
 		}
 	}
-	if cs = strings.ToLower(cs); cs == "" || cs == "utf-8" || cs == "us-ascii" {
-		return data, nil
+	if cs = strings.ToLower(cs); cs != "" && cs != "utf-8" && cs != "us-ascii" {
+		r, err := charset.Reader(cs, bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		if data, err = io.ReadAll(r); err != nil {
+			return nil, err
+		}
 	}
-	r, err := charset.Reader(cs, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
+	if qp {
+		// An "=00" escape decodes to NUL, which no text field can hold. Dropped
+		// only after the charset step: in UTF-16 a zero byte is half a character.
+		data = bytes.ReplaceAll(data, []byte{0}, nil)
 	}
-	return io.ReadAll(r)
+	return data, nil
 }
 
 // metaCharset returns the charset an HTML part declares in a <meta> tag within
