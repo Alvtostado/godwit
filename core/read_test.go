@@ -14,7 +14,9 @@ import (
 	"github.com/godwit-email/godwit/core/conn"
 	"github.com/godwit-email/godwit/core/events"
 	"github.com/godwit-email/godwit/core/internal/testmail"
+	gomail "github.com/godwit-email/godwit/core/mail"
 	"github.com/godwit-email/godwit/core/mailsync"
+	"github.com/godwit-email/godwit/core/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zalando/go-keyring"
@@ -135,6 +137,84 @@ func TestGetThreadOrder(t *testing.T) {
 	assert.Equal(t, "early", th.Messages[0].Snippet)
 	assert.Equal(t, "a", th.Messages[2].Snippet)
 	assert.Equal(t, []string{"bob@example.com"}, th.Messages[2].To)
+}
+
+// Gmail keeps a message in INBOX, each label's folder and All Mail: the
+// thread shows it once, the inbox copy, and actions still reach every copy.
+func TestThreadCopiesShowOnce(t *testing.T) {
+	e := newSyncEnv(t)
+	for _, f := range []string{"All Mail", "Work"} {
+		require.NoError(t, e.im.User.Create(f, nil))
+	}
+	first := eml("o@x", "Bob <bob@example.com>", "alice@example.com", "plan", "Mon, 05 Oct 2026 09:00:00 +0000", "q")
+	reply := eml("r@x", "Dan <dan@example.com>", "alice@example.com", "Re: plan", "Mon, 05 Oct 2026 10:00:00 +0000", "a", "In-Reply-To: <o@x>")
+	e.put(t, "All Mail", first) // the lowest id goes to All Mail's copy
+	e.put(t, "All Mail", reply)
+	e.put(t, "Work", first)
+	e.put(t, "INBOX", first)
+	e.put(t, "Work", reply) // archived: out of INBOX, still labeled
+	e.sync(t)
+	_, err := e.s.db.Execute(bg, "UPDATE folders SET role = 'all' WHERE name = 'All Mail'")
+	require.NoError(t, err)
+	tid := store.Int(e.rows(t, "SELECT DISTINCT thread_id FROM messages WHERE message_id = 'o@x'")[0][0]) // before the second account
+	require.Equal(t, 5, e.count(t, "SELECT count(*) FROM messages WHERE thread_id = ?", tid), "every copy is one thread's")
+
+	th, err := e.s.GetThread(bg, tid)
+	require.NoError(t, err)
+	require.Len(t, th.Messages, 2)
+	assert.Equal(t, e.folderID(t, "INBOX"), th.Messages[0].FolderID, "the inbox copy shows")
+	assert.Equal(t, e.folderID(t, "Work"), th.Messages[1].FolderID, "a label's copy before All Mail's")
+	assert.Len(t, th.Copies, 3)
+	assert.Len(t, th.CopiesOf(th.Messages[0].ID), 2)
+	assert.Len(t, th.CopiesOf(th.Messages[1].ID), 1)
+	assert.Len(t, th.All(), 5)
+
+	p, err := e.s.ListThreads(bg, e.inboxView(t), "", 50)
+	require.NoError(t, err)
+	require.Len(t, p.Items, 1)
+	assert.Equal(t, 2, p.Items[0].Count)
+	assert.Equal(t, 2, p.Items[0].Unread)
+	assert.Equal(t, []string{"Dan", "Bob"}, p.Items[0].Participants)
+
+	work := th.Messages[1].ID
+	allMail := msgIDs(th.Copies)
+	require.NoError(t, e.s.SetFlags(bg, []int64{allMail[len(allMail)-1]}, []string{`\Flagged`}, nil))
+	require.NoError(t, e.s.SetFlags(bg, []int64{th.Messages[0].ID, work}, []string{`\Seen`}, nil))
+	p, err = e.s.ListThreads(bg, e.inboxView(t), "", 50)
+	require.NoError(t, err)
+	assert.Equal(t, 1, p.Items[0].Flagged, "a copy's star is its message's")
+	assert.Equal(t, 2, p.Items[0].Unread, "unread while a copy is")
+	require.NoError(t, e.s.SetMessageSecurity(bg, []int64{allMail[0]}, "manual_warning"))
+	p, err = e.s.ListThreads(bg, e.inboxView(t), "", 50)
+	require.NoError(t, err)
+	want := gomail.DBToSecurityReport("Bob <bob@example.com>", "", "warning", "manual_warning")
+	assert.Equal(t, want.Status, p.Items[0].Security.Status, "a copy's warning is the thread's")
+	th2, err := e.s.GetThread(bg, tid)
+	require.NoError(t, err)
+	merged := th2.Merged()
+	assert.NotContains(t, merged[0].Flags, `\Seen`, "Merged agrees with the list")
+	assert.Contains(t, merged[1].Flags, `\Flagged`)
+	assert.NotContains(t, th2.Messages[1].Flags, `\Flagged`, "each copy keeps its own flags")
+	assert.Equal(t, want.Status, merged[0].Security.Status, "and its gravest security")
+
+	other := e.second(t) // the same mail in another account's inbox is that account's own
+	other.put(t, "INBOX", first)
+	other.sync(t)
+	u, err := e.s.ListThreads(bg, View{Unified: "inbox"}, "", 50)
+	require.NoError(t, err)
+	require.Len(t, u.Items, 2)
+	for _, it := range u.Items {
+		assert.Equal(t, "Bob", it.Participants[len(it.Participants)-1], "each account's thread keeps its copy")
+		assert.NotZero(t, it.Count)
+	}
+
+	_, ids, members, err := e.s.mailTarget(bg, "thread", tid)
+	require.NoError(t, err)
+	assert.Equal(t, msgIDs(th.Messages), ids, "AI reads each message once")
+	assert.Len(t, members, 2)
+	_, ids, _, err = e.s.mailTarget(bg, "thread", tid, allMail[0]) // a quick reply to a copy opened on its own
+	require.NoError(t, err)
+	assert.Equal(t, []int64{allMail[0], th.Messages[1].ID}, ids)
 }
 
 func TestGetMessageSanitized(t *testing.T) {
