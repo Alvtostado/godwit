@@ -18,6 +18,7 @@ import (
 	"github.com/egoist/mygo/ui/markdown"
 	"github.com/godwit-email/godwit/core"
 	"github.com/godwit-email/godwit/core/ai"
+	gomail "github.com/godwit-email/godwit/core/mail"
 	"github.com/godwit-email/godwit/internal/i18n"
 	"github.com/godwit-email/godwit/internal/icons"
 	"github.com/godwit-email/godwit/internal/kit"
@@ -684,6 +685,19 @@ func (r *reader) citeCard(c *ui.Context, anchor ui.Element, m core.MessageSummar
 	})
 }
 
+func (r *reader) replyName(m core.MessageSummary) string {
+	orig := &gomail.Parsed{From: m.From, To: m.To}
+	if body := r.bodies[m.ID]; body != nil && body.ready {
+		orig.ReplyTo = body.msg.ReplyTo
+	}
+	if to, _ := gomail.ReplyRecipients(orig, r.accountOf(m), false); len(to) > 0 {
+		name, _ := sender(to[0])
+		return name
+	}
+	name, _ := sender(m.From)
+	return name
+}
+
 // sourceLabel names a message a digest cites: its day and its
 // sender (the user's sidebar name, else "我").
 func (r *reader) sourceLabel(m core.MessageSummary) string {
@@ -994,7 +1008,7 @@ func (r *reader) replyBar(c *ui.Context) ui.Element {
 				}
 			}
 			kit.InputGroup(c, kit.InputOpts{Flat: true}).Height(th.Space(10)).Padding(0, th.Space(1), 0, th.Space(3)).Gap(th.Space(1)).Children(func() {
-				name, _ := sender(last.From)
+				name := r.replyName(last)
 				in := kit.Input(c, &r.replyAsk, kit.InputOpts{Bare: true, Placeholder: i18n.Tf("reader.reply_wit", name)}).Grow(1).Shrink(1).Label(i18n.T("reader.ask_wit"))
 				if in.Submitted() {
 					r.askReply()
