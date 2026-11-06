@@ -63,6 +63,7 @@ type onboarding struct {
 	askEmail             bool // the provider was picked before an address was typed
 	focusEmail           bool // place the caret before a newly prefilled domain once
 	secret, username     string
+	foundUsername        string // the detected username in username, unless the user replaced it
 	showSecret           bool
 	tab                  int        // ownClientOffered's tabs: 0 the secret, 1 the browser with the user's own OAuth client
 	client               clientForm // the browser tab's own OAuth client
@@ -250,6 +251,7 @@ func (o *onboarding) found(p auth.Provider, email string) {
 			o.prov.IMAP, o.prov.SMTP = p.IMAP, p.SMTP
 			o.setServers(p)
 		}
+		o.setUsername(p.Username)
 	}
 }
 
@@ -260,6 +262,14 @@ func (o *onboarding) setServers(p auth.Provider) {
 	if p.IMAP.Host == "" {
 		o.imapPort, o.imapSec, o.smtpPort, o.smtpSec = "993", core.SecurityTLS, "465", core.SecurityTLS
 	}
+}
+
+// setUsername fills the username with the detected one; what the user typed stays.
+func (o *onboarding) setUsername(u string) {
+	if o.username == o.foundUsername {
+		o.username = u
+	}
+	o.foundUsername = u
 }
 
 // next goes on from the address to its provider's sign-in.
@@ -283,13 +293,14 @@ func (o *onboarding) choose(p auth.Provider) {
 		p = o.detected // the 飞书/Lark tile for an address already found
 	}
 	if manualTile && o.detectedFor == o.email && o.detectedSrc != auth.SourceGuess && o.detected.IMAP.Host != "" {
-		p.IMAP, p.SMTP = o.detected.IMAP, o.detected.SMTP
+		p.IMAP, p.SMTP, p.Username = o.detected.IMAP, o.detected.SMTP, o.detected.Username
 	}
 	if p.ID != o.prov.ID { // what was typed or imported is for the provider it was given to
 		o.secret, o.client = "", clientForm{}
 	}
 	o.prov, o.tab = p, 0
 	o.setServers(p)
+	o.setUsername(p.Username)
 	o.manual = manualTile
 	o.askEmail = !validEmail(o.email)
 	o.focusEmail = false
