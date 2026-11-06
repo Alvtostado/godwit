@@ -1337,9 +1337,14 @@ func (r *reader) message(c *ui.Context, m core.MessageSummary) {
 							if addr != "" && addr != name { // Name <address>, the address quieter
 								kit.Text(c, "<"+addr+">", t.Text.Base).TextColor(t.Muted).SingleLine().Shrink(1)
 							}
+							ui.Icon(c, icons.Get("chevron-down")).Size(theme.IconXs, theme.IconXs).TextColor(t.Muted)
 						})
 						if r.isBlocked(m.From) {
-							kit.Badge(c, i18n.T("reader.blocked_badge"))
+							badge := kit.Pressable(c, kit.PressableOpts{})
+							senderActions(badge)
+							badge.Children(func() {
+								kit.Badge(c, i18n.T("reader.blocked_badge"))
+							})
 						}
 						r.securityBadge(c, m.ID, sec)
 					})

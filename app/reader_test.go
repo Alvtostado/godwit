@@ -987,6 +987,29 @@ func TestReaderSenderPopover(t *testing.T) {
 	h.see(i18n.T("reader.sender_unblocked"))
 }
 
+func TestReaderBlockedBadgeOpensMenu(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	m := h.deliverOne(acc, coretest.Msg("Spammer <spammer@example.com>", acc.Email, "Spam", "buy now"))
+	h.openThread(m.ThreadID)
+	h.seeBody(m.ID)
+	r := h.app.mail.reader
+
+	h.click("spammer@example.com")
+	if err := h.tt.ChooseMenuItem(i18n.T("reader.block_sender")); err != nil {
+		t.Fatal(err)
+	}
+	h.until("blocked", func() bool { return r.isBlocked("spammer@example.com") })
+	h.see(i18n.T("reader.blocked_badge"))
+
+	// Clicking blocked badge opens sender menu
+	h.click(i18n.T("reader.blocked_badge"))
+	if err := h.tt.ChooseMenuItem(i18n.T("reader.unblock_sender")); err != nil {
+		t.Fatal(err)
+	}
+	h.until("unblocked", func() bool { return !r.isBlocked("spammer@example.com") })
+}
+
 func TestReaderBodyRetry(t *testing.T) {
 	h, accs := mailHarness(t, nil, "alice@example.com")
 	m := h.deliverOne(accs[0], coretest.Msg("bob@example.com", accs[0].Email, "Flaky", "eventually shown"))

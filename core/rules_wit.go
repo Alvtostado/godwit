@@ -70,7 +70,7 @@ func (s *Service) registerRuleTool() {
 			"account: an account_id to run on that account's mail only; leave it out for every account. " +
 			"conditions (match all or any; none matches all mail): field from, to, subject or body with op contains, not_contains or is; " +
 			"attachments is yes or no; label (a slug) or folder (inbox, archive, junk or trash) with op is or not_contains; age with op older_than (value: whole days, from 1). " +
-			"actions: label or unlabel (label: a slug), read, star, archive, junk, trash, stop (later rules skip the mail), forward (to: one address), " +
+			"actions: label or unlabel (label: a slug), read, star, archive, junk, trash, block (block the sender), stop (later rules skip the mail), forward (to: one address), " +
 			"pdf (saves the mail as a PDF), eml (saves the original .eml), attachments (saves its attachments), " +
 			"draft_reply (Wit drafts a reply; never sent), key_points (Wit writes the mail's key points as Markdown). " +
 			"pdf, eml, attachments and key_points write into dir, an absolute folder path, and only create files, never replace one; " +
@@ -214,7 +214,7 @@ func ruleDoes(d RuleDoc, labels map[string]string, account string) string {
 		default:
 			acts[i] = cmp.Or(map[string]string{
 				ActionRead: "mark it read", ActionStar: "star it", ActionArchive: "archive it", ActionJunk: "move it to Junk",
-				ActionTrash: "move it to Trash", ActionStop: "skip the rules below it",
+				ActionTrash: "move it to Trash", ActionBlock: "block the sender", ActionStop: "skip the rules below it",
 				ActionDraftReply: "have Wit draft a reply (never sent)", ActionKeyPoints: "have Wit write its key points",
 			}[a.Kind], a.Kind)
 		}

@@ -977,6 +977,62 @@ func TestMailListSecurityIcons(t *testing.T) {
 	}
 }
 
+func TestThreadItemSender(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	h.deliverOne(acc, coretest.Msg("Spammer <spammer@example.com>", acc.Email, "Spam Title", "Buy now"))
+	h.waitMail("one thread", func() bool { return len(h.items()) == 1 })
+	item := h.items()[0]
+	if !item.Thread {
+		t.Fatal("expected item to be a thread")
+	}
+	if item.Msg.From != "Spammer <spammer@example.com>" {
+		t.Fatalf("expected item.Msg.From to be %q, got %q", "Spammer <spammer@example.com>", item.Msg.From)
+	}
+}
+
+func TestThreadMenuBlocksCorrespondentAfterOwnReply(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	h.put(acc, "INBOX", coretest.Msg("bob@example.com", acc.Email, "Plan", "question",
+		coretest.MessageID("a@x"), at(h.clock.Now(), 1)))
+	h.put(acc, "Sent", coretest.Msg(acc.Email, "bob@example.com", "Re: Plan", "answer",
+		coretest.InReplyTo("a@x"), at(h.clock.Now(), 2)))
+	h.syncNow(acc)
+	h.waitMail("one conversation", func() bool { return len(h.items()) == 1 })
+	if err := h.tt.RightClick("Plan"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.tt.ChooseMenuItem(i18n.T("reader.block_sender")); err != nil {
+		t.Fatal(err)
+	}
+	h.until("correspondent blocked", func() bool { return slices.Contains(h.app.blocked, "bob@example.com") })
+	if slices.Contains(h.app.blocked, acc.Email) {
+		t.Fatal("blocked the user's account")
+	}
+}
+
+func TestMessageMenuDoesNotBlockOwnAddress(t *testing.T) {
+	h, accs := mailHarness(t, nil, "alice@example.com")
+	acc := accs[0]
+	st, err := h.env.Svc.GetSettings(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.ThreadView = false
+	if _, err := h.env.Svc.SetSettings(t.Context(), st); err != nil {
+		t.Fatal(err)
+	}
+	h.deliverOne(acc, coretest.Msg(acc.Email, acc.Email, "Note to self", "note"))
+	h.waitMail("one message", func() bool { return len(h.items()) == 1 && !h.app.mail.threads })
+	if err := h.tt.RightClick("Note to self"); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(h.tt.Menu(), i18n.T("reader.block_sender")) {
+		t.Fatal("offered to block the user's account")
+	}
+}
+
 func TestSearchDropsStaleResults(t *testing.T) {
 	h, accs := mailHarness(t, []coretest.Option{coretest.WithoutAutoSync()}, "alice@example.com")
 	h.put(accs[0], "INBOX", coretest.Msg("bob@example.com", "alice@example.com", "Invoice March", "pay"))

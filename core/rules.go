@@ -18,6 +18,7 @@ import (
 	"github.com/egoist/mygo/plugins/sqlite"
 	"github.com/godwit-email/godwit/core/events"
 	"github.com/godwit-email/godwit/core/gateway"
+	gomail "github.com/godwit-email/godwit/core/mail"
 	"github.com/godwit-email/godwit/core/store"
 )
 
@@ -69,6 +70,7 @@ const (
 	ActionArchive = "archive"
 	ActionJunk    = "junk"
 	ActionTrash   = "trash"
+	ActionBlock   = "block"
 	ActionStop    = "stop" // later rules do not run on the message
 	// ActionForward forwards the message to RuleAction.To once the user
 	// confirmed it (Rule.Confirmed); egress, so new mail only (newMailTriggers).
@@ -107,6 +109,7 @@ const (
 	RuleFailNoLabel     = "no_label"
 	RuleFailGone        = "gone" // the message
 	RuleFailUnknown     = "unknown"
+	RuleFailBlock       = "block"
 	RuleFailUnconfirmed = "unconfirmed" // the forward's recipient is not in Rule.Confirmed
 	RuleFailSendCheck   = "send_check"  // a plugin warned about or blocked the forward
 	RuleFailSend        = "send"        // the forward could not be queued
@@ -267,7 +270,7 @@ func (s *Service) validRule(ctx context.Context, d RuleDoc) error {
 			if rcptKey(a.To) == "" {
 				return invalidRule("forward to %q", a.To)
 			}
-		case ActionRead, ActionStar, ActionArchive, ActionJunk, ActionTrash, ActionStop:
+		case ActionRead, ActionStar, ActionArchive, ActionJunk, ActionTrash, ActionBlock, ActionStop:
 		case ActionPDF, ActionEML, ActionAttachments, ActionKeyPoints:
 			if err := validFileAction(d.Actions, a); err != nil {
 				return err
@@ -893,6 +896,10 @@ func (s *Service) runRule(ctx context.Context, r Rule, msgID int64, trigger stri
 // runAction runs acts[i] on the message, its result written in the same
 // transaction; a failure also writes the actions after it as not run.
 func (s *Service) runAction(ctx context.Context, runID int64, acts []RuleAction, i int, msgID int64) (failed bool, err error) {
+	if acts[i].Kind == ActionBlock {
+		s.settingsMu.Lock()
+		defer s.settingsMu.Unlock()
+	}
 	acc, t, ok, err := s.ruleTarget(ctx, msgID)
 	if err != nil {
 		return false, err
@@ -943,7 +950,11 @@ func (s *Service) runAction(ctx context.Context, runID int64, acts []RuleAction,
 		_, err := s.db.Transaction(ctx, stmts)
 		return true, err
 	}
-	return failure != "", s.apply(ctx, acc, []target{t}, stmts)
+	err = s.apply(ctx, acc, []target{t}, stmts)
+	if err == nil && acts[i].Kind == ActionBlock && len(w.writes) > 0 {
+		s.bus.Publish(events.Event{Type: events.SettingsChanged})
+	}
+	return failure != "", err
 }
 
 // ruleResult writes acts[j]'s result.
@@ -1023,12 +1034,12 @@ func (s *Service) runForward(ctx context.Context, r Rule, runID int64, i int, ms
 
 // ruleTarget loads the message an action works on; ok is false when it is gone.
 func (s *Service) ruleTarget(ctx context.Context, id int64) (acc int64, t target, ok bool, err error) {
-	rows, err := s.db.Query(ctx, "SELECT account_id, thread_id, folder_id, flags FROM messages WHERE id = ?", id)
+	rows, err := s.db.Query(ctx, "SELECT account_id, thread_id, folder_id, flags, from_addr FROM messages WHERE id = ?", id)
 	if err != nil || len(rows.Values) == 0 {
 		return 0, t, false, err
 	}
 	v := rows.Values[0]
-	return store.Int(v[0]), target{id: id, thread: store.Int(v[1]), folder: store.Int(v[2]), flags: store.Str(v[3])}, true, nil
+	return store.Int(v[0]), target{id: id, thread: store.Int(v[1]), folder: store.Int(v[2]), flags: store.Str(v[3]), from: store.Str(v[4])}, true, nil
 }
 
 // actionWrites is an action's statements and the prior state they change.
@@ -1041,12 +1052,13 @@ type actionWrites struct {
 // the label's row (Source "" for none), whether the flag was set, the folder
 // it moved the message from and to.
 type rulePrior struct {
-	LabelID int64  `json:"label_id,omitempty"`
-	Source  string `json:"source,omitempty"`
-	Active  bool   `json:"active,omitempty"`
-	Had     bool   `json:"had,omitempty"`
-	From    int64  `json:"from,omitempty"`
-	To      int64  `json:"to,omitempty"`
+	LabelID  int64  `json:"label_id,omitempty"`
+	Source   string `json:"source,omitempty"`
+	Active   bool   `json:"active,omitempty"`
+	Had      bool   `json:"had,omitempty"`
+	From     int64  `json:"from,omitempty"`
+	To       int64  `json:"to,omitempty"`
+	FromAddr string `json:"from_addr,omitempty"`
 }
 
 func hasFlag(flags, f string) bool {
@@ -1095,6 +1107,22 @@ func (s *Service) ruleAction(ctx context.Context, a RuleAction, acc int64, t tar
 		}
 		_, stmts := moveWrites(acc, []target{t}, to)
 		return actionWrites{prior: rulePrior{From: t.folder, To: to}, writes: stmts}, "", nil
+	case ActionBlock:
+		addr := gomail.AddrKey(t.from)
+		blocked, err := s.readList(ctx, blockedSenders)
+		if err != nil {
+			return actionWrites{}, "", err
+		}
+		p := rulePrior{Had: slices.Contains(blocked, addr), FromAddr: addr}
+		if p.Had {
+			return actionWrites{prior: p}, "", nil
+		}
+		blocked, err = addBlockedSender(blocked, addr)
+		if err != nil {
+			return actionWrites{}, RuleFailBlock, nil
+		}
+		stmt, err := listWrite(blockedSenders, blocked)
+		return actionWrites{prior: p, writes: []sqlite.Statement{stmt}}, "", err
 	case ActionStop:
 		return actionWrites{}, "", nil
 	}
@@ -1168,7 +1196,7 @@ func (s *Service) RuleHits(ctx context.Context, ruleID int64) ([]RuleHit, error)
 
 // ruleUndoable are the actions an undo puts back: the local ones. A forward
 // has gone, files written and drafts made stay, and a stop changed nothing.
-var ruleUndoable = []string{ActionLabel, ActionUnlabel, ActionRead, ActionStar, ActionArchive, ActionJunk, ActionTrash}
+var ruleUndoable = []string{ActionLabel, ActionUnlabel, ActionRead, ActionStar, ActionArchive, ActionJunk, ActionTrash, ActionBlock}
 
 // RuleUndoable reports whether UndoRuleRun puts back an action of kind, for
 // the hit history's 撤销, which shows only for a run with one done.
@@ -1265,6 +1293,36 @@ func (s *Service) UndoRuleRun(ctx context.Context, runID int64) (kept int, err e
 func (s *Service) undoAction(ctx context.Context, runID int64, idx int, kind string, p rulePrior, msgID int64) (bool, error) {
 	mark := func(state string) sqlite.Statement {
 		return sqlite.Statement{SQL: "UPDATE rule_action_results SET state = ? WHERE run_id = ? AND idx = ?", Args: []any{state, runID, idx}}
+	}
+	if kind == ActionBlock {
+		s.settingsMu.Lock()
+		defer s.settingsMu.Unlock()
+		rows, err := s.db.Query(ctx, "SELECT state, prior FROM rule_action_results WHERE run_id = ? AND idx = ?", runID, idx)
+		if err != nil {
+			return false, err
+		}
+		if len(rows.Values) == 0 || store.Str(rows.Values[0][0]) != RuleActionDone {
+			return false, nil
+		}
+		if err := json.Unmarshal([]byte(store.Str(rows.Values[0][1])), &p); err != nil {
+			return false, err
+		}
+		blocked, err := s.readList(ctx, blockedSenders)
+		if err != nil {
+			return false, err
+		}
+		if p.Had || p.FromAddr == "" || !slices.Contains(blocked, p.FromAddr) {
+			return false, s.exec(ctx, mark(RuleActionKept))
+		}
+		stmt, err := listWrite(blockedSenders, slices.DeleteFunc(blocked, func(addr string) bool { return addr == p.FromAddr }))
+		if err != nil {
+			return false, err
+		}
+		if _, err := s.db.Transaction(ctx, []sqlite.Statement{stmt, mark(RuleActionUndone)}); err != nil {
+			return false, err
+		}
+		s.bus.Publish(events.Event{Type: events.SettingsChanged})
+		return true, nil
 	}
 	acc, t, ok, err := s.ruleTarget(ctx, msgID)
 	if err != nil {
