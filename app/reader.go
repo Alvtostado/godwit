@@ -109,8 +109,9 @@ type msgBody struct {
 	remote   bool
 	allowErr error
 	trusted  bool
-	// imgFailed is the remote images the proxy could not serve
-	// (BodyImagesFailed); a retry reloads the body.
+	// imgFailed is the images the proxy could not get (BodyImagesFailed); a
+	// retry reloads the body. Offered only while no remote image is blocked,
+	// as the retry is Allow, which lets them load.
 	imgFailed int
 
 	unsub     core.Unsubscribe // how it unsubscribes, by its headers; none until asked
@@ -124,7 +125,7 @@ type msgBody struct {
 
 func newReader(p *mailPage) *reader {
 	return &reader{p: p, open: map[int64]bool{}, bodies: map[int64]*msgBody{}, ai: map[int64]*msgAI{},
-		getThread: p.a.svc.GetThread, getMessage: p.a.svc.GetMessage, getAvatar: p.a.svc.SenderAvatar, runSkill: p.a.svc.RunSkill,
+		getThread: p.a.svc.GetThread, getMessage: p.a.svc.GetMessageLazyImages, getAvatar: p.a.svc.SenderAvatar, runSkill: p.a.svc.RunSkill,
 		cardsFn: p.a.svc.PluginCards, tagsFn: p.a.svc.PluginTags, quickFn: p.a.svc.QuickReplies, gistFn: p.a.svc.MessageGist, skillsFn: p.a.svc.ListSkills, actionsFn: p.a.svc.ListActions}
 }
 
@@ -1701,7 +1702,7 @@ func (a *App) BodyBuilt(view ui.NativeWebView, message int64, cut, remote bool) 
 	}
 }
 
-// BodyImagesFailed is told n of message's remote images could not load:
+// BodyImagesFailed is told n of message's images could not load:
 // the notice offers a retry.
 func (a *App) BodyImagesFailed(view ui.NativeWebView, message int64, n int) {
 	if b := a.mail.reader.shown(view, message); b != nil {
