@@ -191,6 +191,37 @@ func TestSendHTMLWithBcc(t *testing.T) {
 	assert.Empty(t, entries, "raw file removed once archived")
 }
 
+func TestForwardJoinsOriginalThread(t *testing.T) {
+	e := newSendEnv(t, false)
+	e.put(t, "INBOX", eml("o@x", "Bob <bob@example.com>", "alice@example.com", "plan", day, "the plan", "References: <earlier@x>"))
+	e.sync(t)
+	orig := e.idOf(t, "o@x")
+	d, err := e.s.NewDraft(bg, e.acc.ID, "forward", orig)
+	require.NoError(t, err)
+	d.To = []string{"carol@example.com"} // no participant shared with the original
+	d, err = e.s.SaveDraft(bg, d)
+	require.NoError(t, err)
+
+	require.NoError(t, e.s.Send(bg, d.ID))
+	e.clock.Advance(UndoSendWindow)
+	e.sync(t)
+
+	got := e.smtp.Messages()
+	require.Len(t, got, 1)
+	p, err := mail.Parse(got[0].Data)
+	require.NoError(t, err)
+	assert.Empty(t, p.InReplyTo, "a forward is not a reply")
+	assert.Equal(t, []string{"o@x"}, p.References, "the earlier mail's IDs stay out of it")
+	e.sync(t) // the sent copy lands in Sent
+	assert.Equal(t, e.count(t, "SELECT thread_id FROM messages WHERE id = ?", orig),
+		e.count(t, "SELECT thread_id FROM messages WHERE message_id = ?", p.MessageID))
+
+	th, err := e.s.GetThread(bg, int64(e.count(t, "SELECT thread_id FROM messages WHERE id = ?", orig)))
+	require.NoError(t, err)
+	require.Len(t, th.Messages, 2)
+	assert.Equal(t, orig, th.ReplyTarget, "a reply answers Bob, not the forward's recipient")
+}
+
 func TestProviderAutoSavedSentNotDuplicated(t *testing.T) {
 	e := newSendEnv(t, true)
 	e.sendNew(t)
