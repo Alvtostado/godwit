@@ -416,6 +416,8 @@ func (s *Service) GetMessage(ctx context.Context, id int64, loadRemoteImages boo
 		return Message{}, err
 	}
 	inline := map[string]gomail.Attachment{}
+	fetcher := s.newAttachmentFetcher(ctx)
+	defer fetcher.close()
 	for _, a := range ar.Values {
 		info := AttachmentInfo{ID: store.Int(a[0]), Filename: store.Str(a[1]), ContentType: store.Str(a[2]),
 			Size: int(store.Int(a[3])), Inline: store.Int(a[4]) != 0}
@@ -424,7 +426,7 @@ func (s *Service) GetMessage(ctx context.Context, id int64, loadRemoteImages boo
 		if raw == "" || cid == "" || !strings.HasPrefix(info.ContentType, "image/") || !strings.Contains(raw, cid) {
 			continue
 		}
-		path, _, err := s.GetAttachment(ctx, info.ID)
+		path, _, err := fetcher.get(info.ID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return Message{}, ctx.Err()

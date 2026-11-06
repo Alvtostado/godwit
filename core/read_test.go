@@ -334,6 +334,264 @@ func TestGetMessageInlineImage(t *testing.T) {
 	assert.NotZero(t, e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NOT NULL"))
 }
 
+// inlineImagesMail has an inline image per cid, each given by its base64 body.
+func inlineImagesMail(cids []string, bodies map[string]string) string {
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6\r\nkgAAAABJRU5ErkJggg=="
+	raw := "From: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Wed, 08 Oct 2026 10:00:00 +0000\r\n" +
+		"Message-ID: <imgs@example.com>\r\nMIME-Version: 1.0\r\nSubject: Logos\r\nContent-Type: multipart/related; boundary=\"b1\"\r\n\r\n" +
+		"--b1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>hi</p>"
+	for _, cid := range cids {
+		raw += "<img src=\"cid:" + cid + "\">"
+	}
+	raw += "\r\n"
+	for _, cid := range cids {
+		body := png
+		if b, ok := bodies[cid]; ok {
+			body = b
+		}
+		raw += "--b1\r\nContent-Type: image/png\r\nContent-ID: <" + cid + ">\r\nContent-Disposition: inline; filename=\"" + cid +
+			".png\"\r\nContent-Transfer-Encoding: base64\r\n\r\n" + body + "\r\n"
+	}
+	return raw + "--b1--\r\n"
+}
+
+// A message's inline images download over one connection, not one login each:
+// every login is a TLS handshake and a SELECT, so a signature with a few logos
+// made the first open take seconds.
+func TestGetMessageInlineImagesOneLogin(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, nil))
+	e.sync(t)
+	id := e.rows(t, "SELECT id FROM messages")[0][0].(int64)
+	before := e.im.Logins()
+	m, err := e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3, strings.Count(m.HTML, "data:image/"))
+	assert.Equal(t, 3, e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NOT NULL"))
+	assert.Equal(t, before+1, e.im.Logins(), "one login for all inline images")
+	// Cached: opening again needs no connection.
+	_, err = e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, before+1, e.im.Logins())
+}
+
+// A connection lost between two images costs a new login, not the other images.
+func TestGetMessageInlineImagesSurviveLostConnection(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, nil))
+	e.sync(t)
+	id := e.rows(t, "SELECT id FROM messages")[0][0].(int64)
+	before := e.im.Logins()
+	e.im.DropFetchAfter(1)
+	m, err := e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3, strings.Count(m.HTML, "data:image/"))
+	assert.Equal(t, before+2, e.im.Logins())
+}
+
+// One image the server cannot give stays blocked; those after it still show.
+func TestGetMessageInlineImageFailureKeepsTheOthers(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, nil))
+	e.sync(t)
+	id := e.rows(t, "SELECT id FROM messages")[0][0].(int64)
+	_, err := e.s.db.Execute(bg, "UPDATE attachments SET part = '9' WHERE content_id LIKE '%b%'")
+	require.NoError(t, err)
+	m, err := e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, strings.Count(m.HTML, "data:image/"))
+}
+
+// An image past the limit, whatever the row said, costs itself only: those after
+// it still show, and the next open does not download it again.
+func TestGetMessageInlineImageTooLargeKeepsTheOthers(t *testing.T) {
+	e := newSyncEnv(t)
+	big := base64.StdEncoding.EncodeToString(make([]byte, 4<<10))
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, map[string]string{"b": big}))
+	e.sync(t)
+	id := e.rows(t, "SELECT id FROM messages")[0][0].(int64)
+	_, err := e.s.db.Execute(bg, "UPDATE attachments SET size = 1") // understated metadata
+	require.NoError(t, err)
+	old := attachLimit
+	attachLimit = 1000
+	t.Cleanup(func() { attachLimit = old })
+	before := e.im.Logins()
+	m, err := e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, strings.Count(m.HTML, "data:image/"))
+	assert.Equal(t, before+2, e.im.Logins(), "the cut connection is replaced, the big image not tried again")
+	before = e.im.Logins()
+	m, err = e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, strings.Count(m.HTML, "data:image/"))
+	assert.Equal(t, before, e.im.Logins(), "known too large, the rest cached: no connection")
+}
+
+// Whoever takes the account lock between two files, even long after the last one,
+// finds the fetcher's connection closed: a server may limit an account's connections.
+func TestAttachmentFetcherConnectionClosedForNextLockHolder(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", withAttachments("a1@x", "hi", 3))
+	e.sync(t)
+	ids := e.rows(t, "SELECT id FROM attachments ORDER BY id")
+	before := e.im.Logins()
+	f := e.s.newAttachmentFetcher(bg)
+	_, _, err := f.get(ids[0][0].(int64))
+	require.NoError(t, err)
+	_, _, err = f.get(ids[1][0].(int64))
+	require.NoError(t, err)
+	assert.Equal(t, before+1, e.im.Logins(), "no one came between: the connection is reused")
+	kept := e.s.kept[e.acc.ID]
+	require.NotNil(t, kept)
+	unlock, err := e.s.lockAccount(bg, e.acc.ID)
+	require.NoError(t, err)
+	assert.Nil(t, e.s.kept[e.acc.ID])
+	assert.Error(t, kept.c.Noop().Wait(), "closed once the lock was taken")
+	unlock()
+	_, _, err = f.get(ids[2][0].(int64))
+	require.NoError(t, err)
+	assert.Equal(t, before+2, e.im.Logins())
+	require.NoError(t, f.close())
+	assert.Nil(t, e.s.kept[e.acc.ID], "close leaves nothing kept")
+}
+
+// Eviction, after the last image, makes room around all of them.
+func TestGetMessageInlineImagesEvictAroundThemselves(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", withAttachments("a1@x", "hi", 1))
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, nil))
+	e.sync(t)
+	old, _, err := e.s.GetAttachment(bg, e.rows(t, "SELECT id FROM attachments WHERE filename = 'f0.pdf'")[0][0].(int64))
+	require.NoError(t, err)
+	setFor(t, &cacheLimit, 1)
+	id := e.rows(t, "SELECT id FROM messages WHERE subject = 'Logos'")[0][0].(int64)
+	m, err := e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3, strings.Count(m.HTML, "data:image/"))
+	assert.Equal(t, 3, e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NOT NULL"))
+	_, err = os.Stat(old)
+	assert.True(t, os.IsNotExist(err))
+}
+
+// A call cancelled after some downloads still keeps the cache within budget.
+func TestAttachmentFetcherEvictsAfterCancel(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", withAttachments("a1@x", "hi", 2))
+	e.sync(t)
+	ids := e.rows(t, "SELECT id FROM attachments ORDER BY id")
+	old, _, err := e.s.GetAttachment(bg, ids[0][0].(int64))
+	require.NoError(t, err)
+	setFor(t, &cacheLimit, 1)
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	f := e.s.newAttachmentFetcher(ctx)
+	_, _, err = f.get(ids[1][0].(int64))
+	require.NoError(t, err)
+	cancel()
+	require.NoError(t, f.close())
+	_, err = os.Stat(old)
+	assert.True(t, os.IsNotExist(err))
+}
+
+// Eviction outside the account lock waits for a save, and a save for it, so a file
+// saved right after its row cleared is not removed by that eviction.
+func TestEvictAndSaveExcludeEachOther(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", withAttachments("a1@x", "hi", 2))
+	e.sync(t)
+	ids := e.rows(t, "SELECT id FROM attachments ORDER BY id")
+	p, _, err := e.s.GetAttachment(bg, ids[0][0].(int64))
+	require.NoError(t, err)
+
+	e.s.cacheMu.Lock()
+	evicted := make(chan error, 1)
+	go func() { evicted <- e.s.evict(bg, 0) }()
+	saved := make(chan error, 1)
+	go func() { _, _, err := e.s.GetAttachment(bg, ids[1][0].(int64)); saved <- err }()
+	time.Sleep(100 * time.Millisecond)
+	_, err = os.Stat(p)
+	assert.NoError(t, err, "eviction waits")
+	assert.Equal(t, 1, e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NOT NULL"), "neither has changed a row")
+	e.s.cacheMu.Unlock()
+	require.NoError(t, <-evicted)
+	require.NoError(t, <-saved)
+}
+
+// Eviction reads its victims under cacheMu: a file whose row changed while it
+// waited for the lock is not removed on what the row said before.
+func TestEvictReadsVictimsUnderCacheLock(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", withAttachments("a1@x", "hi", 1))
+	e.sync(t)
+	aid := e.rows(t, "SELECT id FROM attachments")[0][0].(int64)
+	p, _, err := e.s.GetAttachment(bg, aid)
+	require.NoError(t, err)
+	e.s.cacheMu.Lock()
+	evicted := make(chan error, 1)
+	go func() { evicted <- e.s.evict(bg, 0) }()
+	time.Sleep(100 * time.Millisecond)
+	_, err = e.s.db.Execute(bg, "UPDATE attachments SET cache_path = NULL WHERE id = ?", aid)
+	require.NoError(t, err)
+	e.s.cacheMu.Unlock()
+	require.NoError(t, <-evicted)
+	_, err = os.Stat(p)
+	assert.NoError(t, err)
+}
+
+// A refused login is not tried again for every image.
+func TestGetMessageInlineImagesStopAtRefusedLogin(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, nil))
+	e.sync(t)
+	id := e.rows(t, "SELECT id FROM messages")[0][0].(int64)
+	dials := 0
+	setFor(t, &afterAccountRead, func(int64) { dials++ })
+	e.im.SetPassword("changed")
+	m, err := e.s.GetMessage(bg, id, false)
+	require.NoError(t, err)
+	assert.Zero(t, strings.Count(m.HTML, "data:image/"))
+	assert.Equal(t, 1, dials)
+}
+
+// Whoever waits for the account lock goes between two images, as it did when each
+// was its own call, and no connection stays open behind its back.
+func TestGetMessageInlineImagesGiveWayToLockWaiter(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", inlineImagesMail([]string{"a", "b", "c"}, nil))
+	e.sync(t)
+	id := e.rows(t, "SELECT id FROM messages")[0][0].(int64)
+	before := e.im.Logins()
+	unlock, err := e.s.lockAccount(bg, e.acc.ID)
+	require.NoError(t, err)
+	queuing := make(chan struct{}, 2)
+	setFor(t, &beforeLockWait, func(int64) { queuing <- struct{}{} })
+	queued := func() { <-queuing; time.Sleep(50 * time.Millisecond) } // from the hook to the lock's queue
+	type result struct {
+		m   Message
+		err error
+	}
+	done := make(chan result, 1)
+	go func() { m, err := e.s.GetMessage(bg, id, false); done <- result{m, err} }()
+	queued() // the read first
+	waiter := make(chan int, 1)
+	go func() {
+		release, err := e.s.lockAccount(bg, e.acc.ID)
+		if err != nil {
+			waiter <- -1
+			return
+		}
+		defer release()
+		waiter <- e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NOT NULL")
+	}()
+	queued() // the waiter behind it
+	unlock()
+	assert.Equal(t, 1, <-waiter, "the waiter goes after the first image")
+	r := <-done
+	require.NoError(t, r.err)
+	assert.Equal(t, 3, strings.Count(r.m.HTML, "data:image/"))
+	assert.Equal(t, before+2, e.im.Logins(), "hung up for the waiter, dialed again after it")
+}
+
 func TestSearchChineseBodyOnly(t *testing.T) {
 	e := newSyncEnv(t)
 	e.put(t, "INBOX", eml("z@x", "finance@x", "alice@example.com", "通知", "Mon, 05 Oct 2026 09:00:00 +0000", "请查收本月发票和报销单"))
@@ -492,6 +750,19 @@ func TestEvictReportsRemovalFailure(t *testing.T) {
 	err = e.s.evict(bg, 0, 0)
 	assert.Error(t, err)
 	assert.Equal(t, 2, e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NULL"), "rows are cleared even when a file stays behind")
+}
+
+func TestEvictKeepsEveryFileGiven(t *testing.T) {
+	e := newSyncEnv(t)
+	e.put(t, "INBOX", withAttachments("a1@x", "hi", 2))
+	e.sync(t)
+	ids := e.rows(t, "SELECT id FROM attachments ORDER BY id")
+	for _, r := range ids {
+		_, _, err := e.s.GetAttachment(bg, r[0].(int64))
+		require.NoError(t, err)
+	}
+	require.NoError(t, e.s.evict(bg, 0, ids[0][0].(int64), ids[1][0].(int64)))
+	assert.Equal(t, 2, e.count(t, "SELECT count(*) FROM attachments WHERE cache_path IS NOT NULL"))
 }
 
 func TestGetAttachmentRereadsRowUnderLock(t *testing.T) {
