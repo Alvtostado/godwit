@@ -398,12 +398,6 @@ func TestWitPageSwitchGeneration(t *testing.T) {
 	f := newWitPageFixture(t)
 	a, b := f.newAsk(t), f.newAsk(t)
 	f.llm.Script(coretest.Turn{Text: []string{"A 的回答"}, Hang: true})
-	ch, err := f.e.Svc.Ask(t.Context(), a, "慢慢回答")
-	require.NoError(t, err)
-	go func() {
-		for range ch {
-		}
-	}()
 	reading, goOn := make(chan struct{}), make(chan struct{})
 	var first atomic.Bool
 	followHook = func() { // A's history read is slow
@@ -419,15 +413,24 @@ func TestWitPageSwitchGeneration(t *testing.T) {
 		done <- err
 	}()
 	<-reading
+	// A's run starts while the page still follows A: its first event may show.
+	ch, err := f.e.Svc.Ask(t.Context(), a, "慢慢回答")
+	require.NoError(t, err)
+	go func() {
+		for range ch {
+		}
+	}()
+	f.waitEvent(t, "A's start", func(ev WitEvent) bool { return ev.Conversation == a && ev.Kind == "start" })
 	_, err = f.p.Follow(f.ctx(), b)
 	require.NoError(t, err)
+	n := len(f.events()) // Follow's end of A's subscription waited for any event being sent
 	close(goOn)
 	<-done
 	f.llm.Release()
 	f.idle(t, a)
 	time.Sleep(20 * time.Millisecond)
-	for _, ev := range f.events() {
-		assert.NotEqual(t, a, ev.Conversation, "A's event reached the page: %+v", ev)
+	for _, ev := range f.events()[n:] {
+		assert.NotEqual(t, a, ev.Conversation, "A's event reached the page after the switch: %+v", ev)
 	}
 	f.w.mu.Lock()
 	assert.Equal(t, b, f.w.f.conv, "B wins")
