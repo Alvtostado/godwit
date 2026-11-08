@@ -179,6 +179,13 @@ func (r *reader) load() {
 		if th, err = get(ctx, k[0]); err != nil {
 			return err
 		}
+		if k[1] != 0 && !slices.ContainsFunc(th.Messages, func(m core.MessageSummary) bool { return m.ID == k[1] }) {
+			m, err := a.svc.GetMessageLazyImages(ctx, k[1], false)
+			if err != nil {
+				return err
+			}
+			k[1] = m.ID // merged into another message since the route was set (ADR 0034)
+		}
 		labels, err = a.svc.ThreadLabels(ctx, []int64{k[0]})
 		return err
 	}, func(err error) {
@@ -190,14 +197,12 @@ func (r *reader) load() {
 			return
 		}
 		r.threadIDs, r.labels, r.thread = nil, labels[k[0]], th
-		for _, m := range th.All() { // every copy: a label goes on each
+		for _, m := range th.Messages {
 			r.threadIDs = append(r.threadIDs, m.ID)
 		}
-		// A thread's actions cover every copy, so it shows their flags; a route
-		// to one copy shows it as it is, though another one shows in the thread.
-		msgs := th.Merged()
+		msgs := th.Messages
 		if k[1] != 0 {
-			msgs = slices.DeleteFunc(th.All(), func(m core.MessageSummary) bool { return m.ID != k[1] })
+			msgs = slices.DeleteFunc(slices.Clone(msgs), func(m core.MessageSummary) bool { return m.ID != k[1] })
 		}
 		known := map[int64]int64{} // messages shown before keep their state
 		for _, m := range r.msgs {
@@ -239,16 +244,10 @@ func (r *reader) load() {
 	})
 }
 
-// markRead flags msgs \Seen, and in a thread their unread copies, so no
-// folder keeps them unread: one call per account, chained after the
+// markRead flags msgs \Seen: one call per account, chained after the
 // account's earlier writes.
 func (r *reader) markRead(msgs []core.MessageSummary) {
 	a := r.p.a
-	if r.key[1] == 0 {
-		for _, m := range slices.Clone(msgs) {
-			msgs = append(msgs, slices.DeleteFunc(r.thread.CopiesOf(m.ID), isSeen)...)
-		}
-	}
 	byAcc := map[int64][]int64{}
 	for _, m := range msgs {
 		acc := r.p.accountOf(m.FolderID)
@@ -1323,7 +1322,7 @@ func (r *reader) message(c *ui.Context, m core.MessageSummary) {
 	} else {
 		sec = gomail.EvaluateSecurity(m.From, "")
 	}
-	if gomail.SecurityRank(m.Security.Status) > gomail.SecurityRank(sec.Status) { // a hidden copy's warning (Merged)
+	if gomail.SecurityRank(m.Security.Status) > gomail.SecurityRank(sec.Status) { // the listed warning, before the body loads
 		sec = m.Security
 	}
 	ui.Column(c).FillWidth().Gap(th.Space(3.5)).Children(func() {
@@ -1947,11 +1946,6 @@ func (r *reader) applySecurity(msgID int64, reason string) {
 		b.msg.Security = sec
 	}
 	ids := []int64{msgID}
-	if r.key[1] == 0 { // in a thread, its copies too, whose warning shows with it
-		for _, c := range r.thread.CopiesOf(msgID) {
-			ids = append(ids, c.ID)
-		}
-	}
 	a.writes.Chain("security", func(ctx context.Context) error {
 		return a.svc.SetMessageSecurity(ctx, ids, reason)
 	}, func(err error) {

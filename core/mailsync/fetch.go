@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -66,6 +67,8 @@ func (a *account) since(now time.Time) time.Time {
 // result collects what one Fetch changed, for the events it publishes.
 type result struct {
 	received, threads, changed, changedThreads []int64
+	orphans                                    []int64 // Gmail messages that lost a server location, for the round's end
+	expunged                                   []int64 // of them, gone from Trash or Spam: Gmail deleted them for good
 	conflicts                                  []string
 	more                                       bool // a range backfill yielded with work left
 }
@@ -95,7 +98,13 @@ func (r *result) merged(target int64, others []int64) {
 // work left: the caller should sync again soon.
 func Fetch(ctx context.Context, db *store.DB, c *imapclient.Client, accountID int64, bus *events.Bus) (more bool, err error) {
 	var r result
-	defer r.publish(bus, accountID)
+	complete := false
+	defer func() {
+		if complete {
+			err = errors.Join(err, r.logArrivals(context.WithoutCancel(ctx), db, accountID))
+		}
+		r.publish(bus, accountID)
+	}()
 	a, err := loadAccount(ctx, db, accountID)
 	if err != nil {
 		return false, err
@@ -105,12 +114,105 @@ func Fetch(ctx context.Context, db *store.DB, c *imapclient.Client, accountID in
 	if err != nil {
 		return false, err
 	}
+	if c.Caps().Has(capGmail) {
+		if err := mergeOld(ctx, db, c, a, folders, &r); err != nil {
+			return false, err
+		}
+	}
+	// A folder the server refuses is skipped, so it cannot hold back the
+	// others' arrivals round after round; a broken connection still stops here.
+	var refused error
 	for _, f := range folders {
 		if err := syncFolder(ctx, db, c, a, f, &r); err != nil {
-			return r.more, fmt.Errorf("sync %q: %w", f.name, err)
+			err = fmt.Errorf("sync %q: %w", f.name, err)
+			var no *imap.Error
+			if !errors.As(err, &no) || ctx.Err() != nil {
+				return r.more, err
+			}
+			refused = errors.Join(refused, err)
+		}
+	}
+	complete = true
+	if refused != nil { // a skipped folder may yet hold a membership, a claim or a stale location
+		return r.more, refused
+	}
+	gmail := c.Caps().Has(capGmail)
+	if gmail {
+		if err := keepInAllMail(ctx, db, c, accountID, &r); err != nil {
+			return r.more, err
+		}
+	}
+	if err := dropOrphans(ctx, db, accountID, r.orphans, true, gmail, &r); err != nil {
+		return r.more, err
+	}
+	if gmail {
+		if err := reshow(ctx, db, accountID, &r); err != nil {
+			return r.more, err
 		}
 	}
 	return r.more, unclaimable(ctx, db, accountID, &r)
+}
+
+// keepInAllMail gives each Gmail orphan dropOrphans would delete its All Mail
+// UID when All Mail still has it: a count-limited sync may never have cached
+// that UID, so a complete scan alone does not prove the message is gone.
+func keepInAllMail(ctx context.Context, db *store.DB, c *imapclient.Client, accountID int64, r *result) error {
+	all, err := db.Query(ctx, "SELECT id, name FROM folders WHERE account_id = ? AND role = 'all'", accountID)
+	if err != nil || len(all.Values) == 0 {
+		return err
+	}
+	rows, err := db.Query(ctx, `SELECT id, gmail_msgid, thread_id FROM messages WHERE account_id = ? AND gmail_msgid IS NOT NULL AND `+orphaned+`
+		AND NOT EXISTS (SELECT 1 FROM ops WHERE message_id = messages.id AND state = 'pending')`, accountID)
+	if err != nil || len(rows.Values) == 0 {
+		return err
+	}
+	folder := store.Int(all.Values[0][0])
+	sel, err := c.Select(store.Str(all.Values[0][1]), nil).Wait()
+	if err != nil {
+		return err
+	}
+	var stmts []sqlite.Statement
+	var ids, tids []int64
+	for _, v := range rows.Values {
+		gid, _ := strconv.ParseUint(store.Str(v[1]), 10, 64)
+		found, err := c.UIDSearch(&imap.SearchCriteria{GmailMsgID: []uint64{gid}}, nil).Wait()
+		if err != nil {
+			return err
+		}
+		if uid := single(found.All); uid != 0 {
+			stmts = append(stmts, locate(store.Int(v[0]), folder, sel.UIDValidity, uid)...)
+			ids, tids = append(ids, store.Int(v[0])), append(tids, store.Int(v[2]))
+		}
+	}
+	if len(stmts) == 0 {
+		return nil
+	}
+	if _, err := db.Transaction(ctx, stmts); err != nil {
+		return err
+	}
+	r.gone(ids, tids)
+	return nil
+}
+
+// reshow shows a Gmail message again in every folder the server has it in
+// once no move or purge of it waits: a location found while one was pending
+// was added hidden, and nothing else shows it after the move succeeds.
+func reshow(ctx context.Context, db *store.DB, accountID int64, r *result) error {
+	const hidden = `FROM message_locations l JOIN messages ON messages.id = l.message_id
+		WHERE messages.account_id = ? AND l.uid IS NOT NULL AND NOT l.shown AND ` + notMoving
+	rows, err := db.Query(ctx, "SELECT DISTINCT messages.id, messages.thread_id "+hidden, accountID)
+	if err != nil || len(rows.Values) == 0 {
+		return err
+	}
+	if _, err := db.Execute(ctx, `UPDATE message_locations SET shown = 1, entered_at = unixepoch() WHERE rowid IN (SELECT l.rowid `+hidden+`)`, accountID); err != nil {
+		return err
+	}
+	var ids, tids []int64
+	for _, v := range rows.Values {
+		ids, tids = append(ids, store.Int(v[0])), append(tids, store.Int(v[1]))
+	}
+	r.gone(ids, tids)
+	return nil
 }
 
 // publish announces what r collected.
@@ -119,7 +221,7 @@ func (r *result) publish(bus *events.Bus, accountID int64) {
 		bus.Publish(events.Event{Type: events.MessageReceived, AccountID: accountID, MessageIDs: r.received, ThreadIDs: r.threads})
 	}
 	if len(r.changed) > 0 {
-		bus.Publish(events.Event{Type: events.MessagesChanged, AccountID: accountID, MessageIDs: r.changed,
+		bus.Publish(events.Event{Type: events.MessagesChanged, AccountID: accountID, MessageIDs: slices.Compact(slices.Sorted(slices.Values(r.changed))),
 			ThreadIDs: slices.Compact(slices.Sorted(slices.Values(r.changedThreads)))})
 	}
 	if len(r.conflicts) > 0 {
@@ -145,7 +247,7 @@ func syncFolder(ctx context.Context, db *store.DB, c *imapclient.Client, a *acco
 		return err
 	}
 	if f.uidValidity != sel.UIDValidity {
-		if err := resetFolder(ctx, db, a.id, f, sel.UIDValidity, r); err != nil {
+		if err := resetFolder(ctx, db, c, a.id, f, sel.UIDValidity, r); err != nil {
 			return err
 		}
 	}
@@ -161,32 +263,79 @@ func syncFolder(ctx context.Context, db *store.DB, c *imapclient.Client, a *acco
 	return syncFlags(ctx, db, c, a.id, f, r)
 }
 
-// resetFolder drops everything known about the folder's old UIDs: their messages
-// (attachments and FTS rows go with them), and pending ops that would act on them
-// become conflicts. Cached attachment files are removed best effort after the
-// commit; one that cannot be removed is no longer referenced, so the startup
-// orphan sweep of the cache directory (store.CleanOrphans) collects it.
-func resetFolder(ctx context.Context, db *store.DB, accountID int64, f *folder, uidValidity uint32, r *result) error {
-	ids, tids, err := doomed(ctx, db, "server_folder_id = ?", f.id)
-	if err != nil {
-		return err
-	}
-	files, err := db.Query(ctx, `SELECT a.cache_path FROM attachments a JOIN messages m ON m.id = a.message_id
-		WHERE m.server_folder_id = ? AND a.cache_path IS NOT NULL`, f.id)
+// resetFolder drops everything known about the folder's old UIDs: their
+// locations, and the messages the server then holds nowhere (orphan), and
+// pending ops that would act on them become conflicts: those taking a message
+// from the folder, and every one of a message held nowhere else.
+func resetFolder(ctx context.Context, db *store.DB, c *imapclient.Client, accountID int64, f *folder, uidValidity uint32, r *result) error {
+	ids, _, err := doomed(ctx, db, serverIn, f.id)
 	if err != nil {
 		return err
 	}
 	stmts := []sqlite.Statement{
 		{SQL: `UPDATE ops SET state = 'conflict' WHERE state = 'pending' AND account_id = ?
-			AND message_id IN (SELECT id FROM messages WHERE server_folder_id = ?)`, Args: []any{accountID, f.id}},
-		{SQL: "DELETE FROM messages WHERE server_folder_id = ?", Args: []any{f.id}},
+			AND message_id IN (SELECT id FROM messages WHERE ` + serverIn + `) AND (src_folder_id = ?
+				OR NOT EXISTS (SELECT 1 FROM message_locations WHERE message_id = ops.message_id AND folder_id != ? AND uid IS NOT NULL))`,
+			Args: []any{accountID, f.id, f.id, f.id}},
+		{SQL: "DELETE FROM message_locations WHERE folder_id = ? AND uid IS NOT NULL", Args: []any{f.id}},
 		{SQL: "UPDATE folders SET uidvalidity = ?, last_uid = 0, synced = 0, filled_since = NULL WHERE id = ?", Args: []any{uidValidity, f.id}},
 	}
+	if _, err := db.Transaction(ctx, stmts); err != nil {
+		return err
+	}
+	f.uidValidity, f.lastUID, f.synced, f.filled = uidValidity, 0, false, nil
+	return r.orphan(ctx, db, c, accountID, ids)
+}
+
+// orphaned is the condition on messages (unaliased) that the server holds the
+// message nowhere Godwit knows and no move of it awaits its claim: it is gone.
+const orphaned = unlocated + " AND NOT EXISTS (SELECT 1 FROM ops WHERE message_id = messages.id AND state = 'awaiting_claim')"
+
+// orphan deletes those of ids, messages sync just dropped a server location
+// of, that are orphaned. Gmail's wait for the round's end (Fetch): a folder
+// synced later may hold them still (ADR 0034).
+func (r *result) orphan(ctx context.Context, db *store.DB, c *imapclient.Client, accountID int64, ids []int64) error {
+	if c.Caps().Has(capGmail) {
+		r.orphans = append(r.orphans, ids...)
+		return nil
+	}
+	return dropOrphans(ctx, db, accountID, ids, false, false, r)
+}
+
+// dropOrphans deletes the orphaned messages of ids (attachments and FTS rows go
+// with them), and with stray those of the account without a location left,
+// should a round that dropped their last one have stopped before its end.
+// Cached attachment files are removed best effort after the commit; one that
+// cannot be removed is no longer referenced, so the startup orphan sweep of
+// the cache directory (store.CleanOrphans) collects it.
+func dropOrphans(ctx context.Context, db *store.DB, accountID int64, ids []int64, stray, gmail bool, r *result) error {
+	which := "id IN (" + marks(len(ids)) + ")"
+	if stray {
+		which = "(" + which + " OR NOT EXISTS (SELECT 1 FROM message_locations WHERE message_id = messages.id))"
+	}
+	if len(ids) == 0 && !stray {
+		return nil
+	}
+	where, args := "account_id = ? AND "+which+" AND "+orphaned, append([]any{accountID}, anys(ids)...)
+	if gmail {
+		where += ` AND NOT EXISTS (SELECT 1 FROM ops WHERE message_id = messages.id AND state = 'pending')
+			AND (gmail_msgid IS NULL OR id IN (` + marks(len(r.expunged)) + `)
+				OR EXISTS (SELECT 1 FROM folders WHERE account_id = messages.account_id AND role = 'all'))`
+		args = append(args, anys(r.expunged)...)
+	}
+	gone, tids, err := doomed(ctx, db, where, args...)
+	if err != nil || len(gone) == 0 {
+		return err
+	}
+	files, err := db.Query(ctx, "SELECT cache_path FROM attachments WHERE cache_path IS NOT NULL AND message_id IN ("+marks(len(gone))+")", anys(gone)...)
+	if err != nil {
+		return err
+	}
+	stmts := []sqlite.Statement{{SQL: "DELETE FROM messages WHERE id IN (" + marks(len(gone)) + ")", Args: anys(gone)}}
 	if _, err := db.Transaction(ctx, append(stmts, tidyThreads(accountID, tids)...)); err != nil {
 		return err
 	}
-	r.gone(ids, tids)
-	f.uidValidity, f.lastUID, f.synced, f.filled = uidValidity, 0, false, nil
+	r.gone(gone, tids)
 	for _, p := range files.Values {
 		os.Remove(store.Str(p[0])) // best effort, see above
 	}
@@ -302,11 +451,11 @@ func arrivalTwins(ctx context.Context, db *store.DB, c *imapclient.Client, a *ac
 // importAbove imports the messages of set above last_uid that are not stored
 // yet, in UID order, and returns the highest UID set has above last_uid.
 func importAbove(ctx context.Context, db *store.DB, c *imapclient.Client, a *account, f *folder, set imap.NumSet, arrivals bool, twins map[string]int, r *result) (uint32, error) {
-	msgs, err := c.Fetch(set, importItems()).Collect()
+	msgs, top, err := fetchImport(ctx, db, c, a, f, set, arrivals, r)
 	if err != nil {
 		return 0, err
 	}
-	have, err := db.Query(ctx, "SELECT server_uid FROM messages WHERE server_folder_id = ? AND server_uid > ?", f.id, f.lastUID)
+	have, err := db.Query(ctx, "SELECT uid FROM message_locations WHERE folder_id = ? AND uid > ?", f.id, f.lastUID)
 	if err != nil {
 		return 0, err
 	}
@@ -314,14 +463,9 @@ func importAbove(ctx context.Context, db *store.DB, c *imapclient.Client, a *acc
 	for _, v := range have.Values {
 		known[uint32(store.Int(v[0]))] = true
 	}
-	last, todo := f.lastUID, msgs[:0]
+	last, todo := max(f.lastUID, top), msgs[:0]
 	for _, m := range msgs {
-		uid := uint32(m.UID)
-		if uid <= f.lastUID {
-			continue
-		}
-		last = max(last, uid)
-		if !known[uid] {
+		if uid := uint32(m.UID); uid > f.lastUID && !known[uid] {
 			todo = append(todo, m)
 		}
 	}
@@ -341,10 +485,22 @@ func advance(ctx context.Context, db *store.DB, f *folder, last uint32) error {
 	return nil
 }
 
-// importItems is what a sync fetches of each message before its text parts.
-func importItems() *imap.FetchOptions {
-	return &imap.FetchOptions{UID: true, Flags: true, RFC822Size: true, InternalDate: true,
+// capGmail marks a Gmail server, which answers X-GM-MSGID (ADR 0034).
+const capGmail imap.Cap = "X-GM-EXT-1"
+
+// importItems is what a sync fetches of each message before its text parts,
+// with X-GM-MSGID only from a Gmail server: others refuse the item.
+func importItems(c *imapclient.Client) *imap.FetchOptions {
+	return &imap.FetchOptions{UID: true, Flags: true, RFC822Size: true, InternalDate: true, GmailMsgID: c.Caps().Has(capGmail),
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true}, BodySection: []*imap.FetchItemBodySection{headerSection()}}
+}
+
+// gmailMsgID is m's X-GM-MSGID as stored: decimal text, NULL when not fetched.
+func gmailMsgID(m *imapclient.FetchMessageBuffer) any {
+	if m.GmailMsgID == 0 {
+		return nil
+	}
+	return strconv.FormatUint(m.GmailMsgID, 10)
 }
 
 // importAll imports msgs in the order given, fetching their text parts in
@@ -408,7 +564,7 @@ func backfill(ctx context.Context, db *store.DB, c *imapclient.Client, a *accoun
 	if a.limit <= 0 {
 		return backfillRange(ctx, db, c, a, f, r)
 	}
-	rows, err := db.Query(ctx, "SELECT count(*), min(server_uid) FROM messages WHERE server_folder_id = ?", f.id)
+	rows, err := db.Query(ctx, "SELECT count(*), min(uid) FROM message_locations WHERE folder_id = ? AND uid IS NOT NULL", f.id)
 	if err != nil {
 		return err
 	}
@@ -431,7 +587,7 @@ func backfill(ctx context.Context, db *store.DB, c *imapclient.Client, a *accoun
 	if len(uids) == 0 {
 		return nil
 	}
-	msgs, err := c.Fetch(imap.UIDSetNum(uids...), importItems()).Collect()
+	msgs, _, err := fetchImport(ctx, db, c, a, f, imap.UIDSetNum(uids...), false, r)
 	if err != nil {
 		return err
 	}
@@ -465,7 +621,7 @@ func backfillRange(ctx context.Context, db *store.DB, c *imapclient.Client, a *a
 	if err != nil {
 		return err
 	}
-	have, err := db.Query(ctx, "SELECT server_uid FROM messages WHERE server_folder_id = ?", f.id)
+	have, err := db.Query(ctx, "SELECT uid FROM message_locations WHERE folder_id = ? AND uid IS NOT NULL", f.id)
 	if err != nil {
 		return err
 	}
@@ -481,7 +637,7 @@ func backfillRange(ctx context.Context, db *store.DB, c *imapclient.Client, a *a
 			return nil
 		}
 		a.budget--
-		msgs, err := c.Fetch(imap.UIDSetNum(page...), importItems()).Collect()
+		msgs, _, err := fetchImport(ctx, db, c, a, f, imap.UIDSetNum(page...), false, r)
 		if err != nil {
 			return err
 		}
